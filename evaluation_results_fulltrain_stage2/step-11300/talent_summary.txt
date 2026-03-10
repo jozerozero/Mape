@@ -1,0 +1,6 @@
+Model: step-11300
+Total datasets: 149
+Average accuracy: 0.815000
+Total time s: 872.535
+Average time s: 5.856
+Average train_ratio: 0.799911

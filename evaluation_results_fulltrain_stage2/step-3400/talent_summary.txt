@@ -1,0 +1,6 @@
+Model: step-3400
+Total datasets: 149
+Average accuracy: 0.796724
+Total time s: 872.916
+Average time s: 5.858
+Average train_ratio: 0.799911

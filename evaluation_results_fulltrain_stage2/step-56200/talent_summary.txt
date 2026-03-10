@@ -1,0 +1,10 @@
+Model: step-56200
+Total datasets: 149
+Average accuracy: 0.831548
+Total time s: 794.239
+Average time s: 5.330
+Average prep time s: 0.003
+Average fit time s: 0.145
+Average predict time s: 5.186
+Average end-to-end time s: 5.334
+Average train_ratio: 0.799911

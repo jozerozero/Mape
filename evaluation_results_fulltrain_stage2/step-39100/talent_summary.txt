@@ -1,0 +1,10 @@
+Model: step-39100
+Total datasets: 149
+Average accuracy: 0.780025
+Total time s: 787.444
+Average time s: 5.285
+Average prep time s: 0.003
+Average fit time s: 0.143
+Average predict time s: 5.142
+Average end-to-end time s: 5.288
+Average train_ratio: 0.799911

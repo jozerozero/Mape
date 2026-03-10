@@ -1,0 +1,10 @@
+Model: step-48000
+Total datasets: 149
+Average accuracy: 0.827545
+Total time s: 794.101
+Average time s: 5.330
+Average prep time s: 0.003
+Average fit time s: 0.145
+Average predict time s: 5.185
+Average end-to-end time s: 5.333
+Average train_ratio: 0.799911

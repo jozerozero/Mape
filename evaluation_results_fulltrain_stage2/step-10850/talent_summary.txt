@@ -1,0 +1,6 @@
+Model: step-10850
+Total datasets: 149
+Average accuracy: 0.812804
+Total time s: 876.915
+Average time s: 5.885
+Average train_ratio: 0.799911

@@ -1,0 +1,10 @@
+Model: step-57050
+Total datasets: 149
+Average accuracy: 0.831636
+Total time s: 794.840
+Average time s: 5.334
+Average prep time s: 0.003
+Average fit time s: 0.142
+Average predict time s: 5.192
+Average end-to-end time s: 5.338
+Average train_ratio: 0.799911

@@ -1,0 +1,6 @@
+Model: step-3800
+Total datasets: 149
+Average accuracy: 0.795966
+Total time s: 868.986
+Average time s: 5.832
+Average train_ratio: 0.799911

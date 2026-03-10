@@ -1,0 +1,6 @@
+Model: step-16200
+Total datasets: 149
+Average accuracy: 0.818894
+Total time s: 858.185
+Average time s: 5.760
+Average train_ratio: 0.799911

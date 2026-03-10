@@ -1,0 +1,10 @@
+Model: step-51900
+Total datasets: 149
+Average accuracy: 0.828524
+Total time s: 797.785
+Average time s: 5.354
+Average prep time s: 0.003
+Average fit time s: 0.144
+Average predict time s: 5.210
+Average end-to-end time s: 5.358
+Average train_ratio: 0.799911

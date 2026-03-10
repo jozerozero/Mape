@@ -1,0 +1,6 @@
+Model: step-5100
+Total datasets: 149
+Average accuracy: 0.472188
+Total time s: 852.627
+Average time s: 5.722
+Average train_ratio: 0.799911

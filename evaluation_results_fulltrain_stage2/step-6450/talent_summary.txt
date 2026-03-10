@@ -1,0 +1,6 @@
+Model: step-6450
+Total datasets: 149
+Average accuracy: 0.795776
+Total time s: 876.268
+Average time s: 5.881
+Average train_ratio: 0.799911

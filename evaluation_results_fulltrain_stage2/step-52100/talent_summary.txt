@@ -1,0 +1,10 @@
+Model: step-52100
+Total datasets: 149
+Average accuracy: 0.828786
+Total time s: 791.231
+Average time s: 5.310
+Average prep time s: 0.003
+Average fit time s: 0.143
+Average predict time s: 5.168
+Average end-to-end time s: 5.314
+Average train_ratio: 0.799911

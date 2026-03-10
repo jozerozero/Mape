@@ -1,0 +1,6 @@
+Model: step-17350
+Total datasets: 149
+Average accuracy: 0.819936
+Total time s: 867.134
+Average time s: 5.820
+Average train_ratio: 0.799911

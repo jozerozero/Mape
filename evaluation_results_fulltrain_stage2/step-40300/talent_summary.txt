@@ -1,0 +1,10 @@
+Model: step-40300
+Total datasets: 149
+Average accuracy: 0.825774
+Total time s: 800.600
+Average time s: 5.373
+Average prep time s: 0.003
+Average fit time s: 0.142
+Average predict time s: 5.231
+Average end-to-end time s: 5.376
+Average train_ratio: 0.799911

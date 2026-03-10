@@ -1,0 +1,10 @@
+Model: step-46600
+Total datasets: 149
+Average accuracy: 0.826166
+Total time s: 793.595
+Average time s: 5.326
+Average prep time s: 0.003
+Average fit time s: 0.145
+Average predict time s: 5.181
+Average end-to-end time s: 5.329
+Average train_ratio: 0.799911

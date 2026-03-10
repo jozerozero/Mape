@@ -1,0 +1,10 @@
+Model: step-41550
+Total datasets: 149
+Average accuracy: 0.824200
+Total time s: 791.737
+Average time s: 5.314
+Average prep time s: 0.003
+Average fit time s: 0.142
+Average predict time s: 5.171
+Average end-to-end time s: 5.317
+Average train_ratio: 0.799911

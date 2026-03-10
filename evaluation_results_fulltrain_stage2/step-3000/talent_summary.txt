@@ -1,0 +1,6 @@
+Model: step-3000
+Total datasets: 149
+Average accuracy: 0.785051
+Total time s: 863.011
+Average time s: 5.792
+Average train_ratio: 0.799911

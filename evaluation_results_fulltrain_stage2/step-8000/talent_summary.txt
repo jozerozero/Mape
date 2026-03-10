@@ -1,0 +1,6 @@
+Model: step-8000
+Total datasets: 149
+Average accuracy: 0.799797
+Total time s: 862.058
+Average time s: 5.786
+Average train_ratio: 0.799911

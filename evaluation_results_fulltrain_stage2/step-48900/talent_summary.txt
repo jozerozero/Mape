@@ -1,0 +1,10 @@
+Model: step-48900
+Total datasets: 149
+Average accuracy: 0.824546
+Total time s: 792.876
+Average time s: 5.321
+Average prep time s: 0.003
+Average fit time s: 0.145
+Average predict time s: 5.177
+Average end-to-end time s: 5.325
+Average train_ratio: 0.799911

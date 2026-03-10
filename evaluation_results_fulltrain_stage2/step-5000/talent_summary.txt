@@ -1,0 +1,6 @@
+Model: step-5000
+Total datasets: 149
+Average accuracy: 0.795095
+Total time s: 876.335
+Average time s: 5.881
+Average train_ratio: 0.799911
