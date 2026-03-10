@@ -197,3 +197,5 @@ wandb/
 # Weights & Biases
 wandb/
 *.wandb
+# numpy archives
+*.npz
