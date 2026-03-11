@@ -94,6 +94,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --optimizer '"${OPTIMIZER}"' \
             --scheduler cosine_with_restarts \
             --cosine_num_cycles 5 \
+            --cosine_amplitude_decay 0.5 \
             --cosine_lr_end 2e-5 \
             --warmup_proportion 0.05 \
             --restart_data_selection True \
