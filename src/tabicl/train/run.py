@@ -364,6 +364,16 @@ class Trainer:
         self.reference_direction_count_ = 0
         self.reference_direction_ = None
 
+        # Only use ICL module gradients for direction computation.
+        self.icl_direction_params_ = [p for p in self.raw_model.icl_predictor.parameters() if p.requires_grad]
+        self.icl_direction_dim_ = int(sum(p.numel() for p in self.icl_direction_params_))
+        if self.restart_data_selection_active and (len(self.icl_direction_params_) == 0 or self.icl_direction_dim_ == 0):
+            self.restart_data_selection_active = False
+            if self.master_process:
+                print(
+                    "restart_data_selection disabled: icl_predictor has no trainable parameters."
+                )
+
         if self.master_process and self.config.restart_data_selection and not self.restart_data_selection_active:
             print(
                 "restart_data_selection is enabled but inactive. "
@@ -393,22 +403,33 @@ class Trainer:
         return min(cycle_idx, num_cycles - 1)
 
     @staticmethod
-    def _dataset_direction_from_logits(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        """Build per-dataset gradient-direction proxy from logits.
+    def _flatten_grad_list(grads: tuple[torch.Tensor | None, ...]) -> torch.Tensor | None:
+        chunks = [g.detach().reshape(-1) for g in grads if g is not None]
+        if not chunks:
+            return None
+        vec = torch.cat(chunks, dim=0)
+        return F.normalize(vec, dim=0, eps=1e-12)
 
-        Proxy = normalized mean over tokens of (softmax(logits) - one_hot(target)).
-        """
-        num_classes = logits.shape[-1]
-        probs = torch.softmax(logits, dim=-1)
-        one_hot = F.one_hot(targets, num_classes=num_classes).to(probs.dtype)
-        grad_proxy = probs - one_hot  # (B, T, C)
-
-        valid = valid_mask.to(dtype=probs.dtype).unsqueeze(-1)  # (B, T, 1)
-        grad_proxy = grad_proxy * valid
-        denom = valid.sum(dim=1).clamp_min(1.0)  # (B, 1)
-        grad_proxy = grad_proxy.sum(dim=1) / denom  # (B, C)
-        grad_proxy = F.normalize(grad_proxy, dim=-1, eps=1e-12)
-        return grad_proxy
+    def _dataset_direction_from_icl_grads(self, dataset_losses: torch.Tensor) -> torch.Tensor:
+        """Compute per-dataset direction vectors using only ICL module gradients."""
+        dirs = []
+        for i in range(dataset_losses.shape[0]):
+            grads = torch.autograd.grad(
+                dataset_losses[i],
+                self.icl_direction_params_,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+            vec = self._flatten_grad_list(grads)
+            if vec is None:
+                vec = torch.zeros(
+                    self.icl_direction_dim_,
+                    device=dataset_losses.device,
+                    dtype=dataset_losses.dtype,
+                )
+            dirs.append(vec)
+        return torch.stack(dirs, dim=0)
 
     def _update_reference_direction(self, dataset_dirs: torch.Tensor) -> None:
         if dataset_dirs.numel() == 0:
@@ -722,15 +743,12 @@ class Trainer:
             dataset_weights = None
             dataset_sims = None
             if self.restart_data_selection_active and self.config.scheduler == "cosine_with_restarts":
-                with torch.no_grad():
-                    dataset_dirs = self._dataset_direction_from_logits(
-                        logits.detach(), true_for_loss, valid_mask
-                    )
-                    # Build reference direction from first full cycle.
-                    if cycle_idx == 0:
-                        self._update_reference_direction(dataset_dirs)
-                    self._try_finalize_reference_direction(cycle_idx)
-                    dataset_weights, dataset_sims = self._compute_dataset_weights(dataset_dirs, cycle_idx)
+                dataset_dirs = self._dataset_direction_from_icl_grads(dataset_loss)
+                # Build reference direction from first full cycle.
+                if cycle_idx == 0:
+                    self._update_reference_direction(dataset_dirs)
+                self._try_finalize_reference_direction(cycle_idx)
+                dataset_weights, dataset_sims = self._compute_dataset_weights(dataset_dirs, cycle_idx)
 
             if dataset_weights is not None:
                 loss = (dataset_loss * dataset_weights).mean()
