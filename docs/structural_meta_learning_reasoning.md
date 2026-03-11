@@ -243,3 +243,208 @@ $$
 4. **并行做你已有 data-selection 机制对接**：优先验证“ICL-only 梯度是否更稳”
 
 这个路线能把风险拆开，保证每一步都可验证。
+
+---
+
+## 2. 补充设计 A：基于 SCM 生成器控制结构原语（Chain/Fork/Collider）
+
+本节回答两个工程问题：
+1. 原语可控的 SCM 生成器怎么设计？
+2. 这种结构信息以什么形式保存，便于训练和统计？
+
+### 2.1 设计目标（先定义“可控”）
+
+我们希望每个合成任务可以通过参数显式控制：
+
+1. 节点规模：`n_obs`（观测节点数，含 `X` 与 `Y`）
+2. 目标节点：`y_idx`（建议固定，便于跨任务统计）
+3. 原语混合比例：`motif_mix = {chain, fork, collider}`
+4. 背景稀疏度：`bg_edge_rate`
+5. 混杂强度：`latent_confounder_rate`（决定双向边出现概率）
+6. 图约束：`max_in_degree`, `max_out_degree`, `acyclic=True`
+7. 可选目标统计：`target_ratios = {parent, child, sibling, other}`
+
+### 2.2 参考 motif 工作的思路：Backbone + Motif Injection
+
+图神经网络中常见的 motif 合成套路是：
+1. 先造一个背景图（backbone）
+2. 再按分布注入 motifs
+3. 最后做结构标签和任务标签生成
+
+可参考的实践风格包括：
+1. motif-specific 邻接通道（不同 motif 不同通道）
+2. BA/ER 背景图上注入 house/cycle 等结构块
+3. motif 注入后再做结构解释/识别任务
+
+对 SCM 场景可直接改写为：
+1. 先生成背景 DAG
+2. 按 `motif_mix` 注入 chain/fork/collider 模板
+3. 再注入 latent confounder（双向边）
+4. 在该图上采样结构方程并生成数据
+
+### 2.3 生成流程（可执行版本）
+
+#### Step 1：生成背景 DAG（不含双向边）
+
+1. 对节点采样拓扑顺序 `pi`
+2. 仅允许从前到后连边，确保无环
+3. 按 `bg_edge_rate` 采样边
+4. 若超出 `max_in_degree/max_out_degree`，做局部重采样
+
+得到 `A_dir_bg in {0,1}^{N x N}`。
+
+#### Step 2：按比例注入原语模板
+
+令总注入数量为 `K_motif`，按 `motif_mix` 分配：
+1. Chain 模板：`a -> b -> c`
+2. Fork 模板：`a <- b -> c`
+3. Collider 模板：`a -> b <- c`
+
+实现要点：
+1. 优先从“可用节点池”抽样，避免与既有边冲突
+2. 必要时允许覆盖背景边（并记录 provenance）
+3. 可配置是否“锚定 Y”：
+   - `collider@Y`: `x_i -> y <- x_j`
+   - `fork@Y`: `y -> x_i, y -> x_j`
+   - `chain-through-Y`: `x_i -> y -> x_j` 或 `x_i -> x_j -> y`
+
+#### Step 3：注入 latent confounder（双向边）
+
+对节点对 `(i,j)` 按 `latent_confounder_rate` 采样隐混杂：
+1. 若命中，记录 `i <-> j`
+2. 双向边不写入 DAG 拓扑通道，单独存入 `A_bidir`
+
+这样可同时满足：
+1. 有向结构可用于拓扑生成
+2. 隐混杂可用于“兄弟关系”统计和结构偏移控制
+
+#### Step 4：结构修正（可选，保证比例达标）
+
+如果需要逼近目标比例（如真实数据中的父/子/兄弟/其他）：
+1. 计算当前 `Y` 邻域统计
+2. 与 `target_ratios` 比较
+3. 迭代执行局部 rewiring：
+   - 补 parent：增加 `x -> y`
+   - 补 child：增加 `y -> x`
+   - 补 sibling：增加 `x <-> y`（通过 latent confounder 标注）
+   - 降 other：优先在 Y 邻域外删边
+4. 直到误差小于容差或迭代上限
+
+#### Step 5：在固定图上采样机制
+
+图确定后再采样每个节点机制（MLP/Tree）：
+1. 按拓扑序生成有向部分
+2. 对双向边以“共享噪声项/隐变量注入”模拟
+3. 输出 `(X, y)` 与结构标签
+
+核心原则：**结构与机制解耦**。  
+这样你可在同一结构下替换不同函数族，单独研究“结构迁移 vs 函数迁移”。
+
+### 2.4 与当前 Mape 代码的衔接建议（不改代码版）
+
+你当前 `MLPSCM/TreeSCM` 的 `graph_sparsity` 更像“相关性削弱”，不是显式 motif 控图。  
+建议下一步新增一个“结构先行”层：
+
+1. `SCMGraphGenerator`：只负责生成 `A_dir/A_bidir/motif_meta`
+2. `SCMMechanismSampler`：在给定图上生成数据
+3. `SCMTaskBuilder`：组装成训练任务并附带 graph_pack
+
+这样不会破坏现有生成器逻辑，可以 feature flag 逐步切换。
+
+### 2.5 推荐的参数接口（草案）
+
+```text
+--scm_graph_mode motif_controlled
+--n_obs 20
+--y_idx -1
+--bg_edge_rate 0.08
+--motif_total 12
+--motif_mix_chain 0.30
+--motif_mix_fork 0.45
+--motif_mix_collider 0.25
+--latent_confounder_rate 0.10
+--max_in_degree 4
+--max_out_degree 4
+--target_parent_ratio 0.08
+--target_child_ratio 0.17
+--target_sibling_ratio 0.03
+--target_ratio_tolerance 0.02
+```
+
+### 2.6 质量控制（必须有）
+
+每次生成后建议记录并检查：
+1. DAG 无环性（仅 `A_dir`）
+2. 度分布与稀疏度
+3. `Y` 的 parent/child/sibling/other 比例
+4. motif 计数偏差（目标 vs 实际）
+5. 数据是否有 NaN/Inf
+
+---
+
+## 3. 补充设计 B：结构以什么形式保存
+
+建议分两层保存：训练时张量格式 + 落盘格式。
+
+### 3.1 训练时（dataloader）统一返回 `graph_pack`
+
+对 batch 大小 `B`、padding 后节点数 `N_max`：
+
+1. `adj_dir`: `bool/uint8`, shape `(B, N_max, N_max)`  
+   表示有向边 `i -> j`
+2. `adj_bidir`: `bool/uint8`, shape `(B, N_max, N_max)`  
+   表示双向边 `i <-> j`（隐混杂）
+3. `node_mask`: `bool`, shape `(B, N_max)`  
+   有效节点 mask（处理不同维度数据）
+4. `y_index`: `int64`, shape `(B,)`  
+   每个样本里 Y 的节点索引
+5. `motif_type`（可选）: `uint8`, shape `(B, N_max, N_max)`  
+   边来源标签：`0=bg,1=chain,2=fork,3=collider,4=latent`
+
+这是最直接支持你“先不喂模型，只做统计和对齐”的格式。
+
+### 3.2 落盘格式（推荐）
+
+每个 batch 一份 `.npz` 或 `.pt`：
+
+1. 原有数据：`X, y, d, seq_len, train_size`
+2. 图结构：`adj_dir, adj_bidir, node_mask, y_index`
+3. 元信息：`meta.json`
+   - 生成参数（motif_mix、稀疏度、confounder_rate）
+   - 随机种子
+   - 当前 batch 的结构统计摘要
+
+### 3.3 稀疏存储（大维度时）
+
+当 `N_max` 大而图稀疏，建议 edge-list：
+
+1. `edge_index_dir`: `int32[2, E_dir]`
+2. `edge_index_bidir`: `int32[2, E_bidir]`
+3. `edge_type`: `uint8[E_total]`
+4. `graph_ptr`: `int32[B+1]`（批次拼接边界）
+
+优点：
+1. 节省磁盘与内存
+2. 便于图算子库（PyG/DGL）直接消费
+
+### 3.4 建议的“统计审计表”
+
+额外维护一个 `summary.tsv/parquet`（每图一行）：
+
+1. `graph_id, n_obs, sparsity`
+2. `parent_ratio, child_ratio, sibling_ratio, other_ratio`
+3. `chain_count, fork_count, collider_count, latent_count`
+4. `seed, split(train/val/test), config_hash`
+
+这张表对你后续做 data selection 和结构分桶评估非常关键。
+
+---
+
+## 4. 一个最小可行实现顺序（仅设计）
+
+1. 先实现 `A_dir/A_bidir + y_index + node_mask` 保存与统计（不改训练）
+2. 再引入 motif injection（先不做 target ratio 修正）
+3. 再加 target ratio 修正器（保证生成分布贴近真实）
+4. 最后将 `graph_pack` 接入结构探测头与推理权重模块
+
+这样可以确保每一步都可观测、可回滚。
