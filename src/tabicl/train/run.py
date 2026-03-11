@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.multiprocessing import set_start_method
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
 
 from tqdm import tqdm
 import wandb
@@ -89,6 +89,7 @@ class Trainer:
         self.configure_prior()
         self.configure_optimizer()
         self.configure_amp()
+        self.configure_restart_data_selection()
         self.load_checkpoint()
 
     def configure_ddp(self):
@@ -340,6 +341,121 @@ class Trainer:
         else:
             self.amp_ctx = nullcontext()
 
+    def _resolve_warmup_steps(self) -> int:
+        """Resolve warmup steps from either proportion or explicit step count."""
+        if self.config.warmup_proportion >= 0:
+            return int(self.config.max_steps * self.config.warmup_proportion)
+        return int(self.config.warmup_steps)
+
+    def configure_restart_data_selection(self):
+        """Configure gradient-direction-based data selection for cosine restarts."""
+        self.restart_data_selection_active = bool(
+            self.config.restart_data_selection
+            and self.config.scheduler == "cosine_with_restarts"
+            and int(self.config.cosine_num_cycles) > 1
+        )
+        self.restart_data_selection_start_cycle = max(0, int(self.config.restart_data_selection_start_cycle))
+        self.restart_data_selection_min_weight = float(self.config.restart_data_selection_min_weight)
+        self.restart_data_selection_power = float(self.config.restart_data_selection_power)
+        self.warmup_steps_ = self._resolve_warmup_steps()
+
+        # Accumulate reference direction in cycle 0; use it from cycle >= start_cycle.
+        self.reference_direction_sum_ = None
+        self.reference_direction_count_ = 0
+        self.reference_direction_ = None
+
+        if self.master_process and self.config.restart_data_selection and not self.restart_data_selection_active:
+            print(
+                "restart_data_selection is enabled but inactive. "
+                "It requires scheduler=cosine_with_restarts and cosine_num_cycles > 1."
+            )
+
+        if self.master_process and self.restart_data_selection_active:
+            print(
+                "Restart data selection enabled: "
+                f"start_cycle={self.restart_data_selection_start_cycle}, "
+                f"min_weight={self.restart_data_selection_min_weight}, "
+                f"power={self.restart_data_selection_power}"
+            )
+
+    def get_restart_cycle_idx(self, step: int) -> int:
+        """Return cycle index for cosine_with_restarts; -1 means warmup/non-restart."""
+        if self.config.scheduler != "cosine_with_restarts":
+            return -1
+        if step < self.warmup_steps_:
+            return -1
+
+        total_after_warmup = max(1, int(self.config.max_steps) - self.warmup_steps_)
+        progress = float(step - self.warmup_steps_) / float(total_after_warmup)
+        progress = min(max(progress, 0.0), 0.999999)
+        num_cycles = max(1, int(self.config.cosine_num_cycles))
+        cycle_idx = int(num_cycles * progress)
+        return min(cycle_idx, num_cycles - 1)
+
+    @staticmethod
+    def _dataset_direction_from_logits(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """Build per-dataset gradient-direction proxy from logits.
+
+        Proxy = normalized mean over tokens of (softmax(logits) - one_hot(target)).
+        """
+        num_classes = logits.shape[-1]
+        probs = torch.softmax(logits, dim=-1)
+        one_hot = F.one_hot(targets, num_classes=num_classes).to(probs.dtype)
+        grad_proxy = probs - one_hot  # (B, T, C)
+
+        valid = valid_mask.to(dtype=probs.dtype).unsqueeze(-1)  # (B, T, 1)
+        grad_proxy = grad_proxy * valid
+        denom = valid.sum(dim=1).clamp_min(1.0)  # (B, 1)
+        grad_proxy = grad_proxy.sum(dim=1) / denom  # (B, C)
+        grad_proxy = F.normalize(grad_proxy, dim=-1, eps=1e-12)
+        return grad_proxy
+
+    def _update_reference_direction(self, dataset_dirs: torch.Tensor) -> None:
+        if dataset_dirs.numel() == 0:
+            return
+        batch_sum = dataset_dirs.detach().sum(dim=0)
+        if self.reference_direction_sum_ is None:
+            self.reference_direction_sum_ = batch_sum
+        else:
+            self.reference_direction_sum_ = self.reference_direction_sum_ + batch_sum
+        self.reference_direction_count_ += int(dataset_dirs.shape[0])
+
+    def _try_finalize_reference_direction(self, cycle_idx: int) -> None:
+        if self.reference_direction_ is not None:
+            return
+        if cycle_idx < self.restart_data_selection_start_cycle:
+            return
+        if self.reference_direction_sum_ is None or self.reference_direction_count_ <= 0:
+            return
+
+        sum_vec = self.reference_direction_sum_.detach().clone()
+        count = torch.tensor(float(self.reference_direction_count_), device=sum_vec.device)
+        if self.ddp:
+            all_reduce(sum_vec, op=ReduceOp.SUM)
+            all_reduce(count, op=ReduceOp.SUM)
+
+        ref = sum_vec / count.clamp_min(1.0)
+        self.reference_direction_ = F.normalize(ref, dim=0, eps=1e-12)
+
+        if self.master_process:
+            print(
+                f"Reference direction ready at step={self.curr_step}, count={int(count.item())}"
+            )
+
+    def _compute_dataset_weights(self, dataset_dirs: torch.Tensor, cycle_idx: int):
+        if not self.restart_data_selection_active:
+            return None, None
+        if cycle_idx < self.restart_data_selection_start_cycle:
+            return None, None
+        if self.reference_direction_ is None:
+            return None, None
+
+        ref = self.reference_direction_.to(device=dataset_dirs.device, dtype=dataset_dirs.dtype)
+        sims = F.cosine_similarity(dataset_dirs, ref.unsqueeze(0), dim=-1, eps=1e-12).clamp(-1.0, 1.0)
+        weights = ((sims + 1.0) * 0.5).pow(self.restart_data_selection_power)
+        weights = weights.clamp(min=self.restart_data_selection_min_weight, max=1.0)
+        return weights, sims
+
     def get_latest_checkpoint(self):
         """Returns the latest checkpoint from `checkpoint_dir`
 
@@ -532,7 +648,7 @@ class Trainer:
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
 
-    def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
+    def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches, cycle_idx):
         """
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
@@ -565,16 +681,15 @@ class Trainer:
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
-        
+
         micro_X = micro_X.to(self.config.device)
-        # micro_X = torch.clamp(micro_X, min=-10.0, max=10.0)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
-        y_test  = micro_y[:, train_size:]
+        y_test = micro_y[:, train_size:]
 
-        # early exit if nothing to predict
+        # Early exit if nothing to predict.
         if y_test.numel() == 0:
             return {"ce": 0.0, "accuracy": 0.0}
 
@@ -584,32 +699,63 @@ class Trainer:
         with self.amp_ctx:
             logits = self.model(micro_X, y_train, micro_d)  # (B, Ttest, C)
             B, T, C = logits.shape
-            pred  = logits.reshape(-1, C)
-            true  = y_test.reshape(-1).long()
+            true = y_test.long()  # (B, T)
 
-            # drop any labels outside [0, C-1] (corrupt/padded labels)
-            valid = (true >= 0) & (true < C)
-            if not torch.all(valid):
-                true = true[valid]
-                pred = pred[valid]
-            if true.numel() == 0:
+            # Handle invalid labels robustly via masking.
+            valid_mask = (true >= 0) & (true < C)
+            if not valid_mask.any():
                 return {"ce": 0.0, "accuracy": 0.0}
 
-            loss = F.cross_entropy(pred, true)
+            true_for_loss = true.clone()
+            true_for_loss[~valid_mask] = 0
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, C),
+                true_for_loss.reshape(-1),
+                reduction="none",
+            ).view(B, T)
 
-        # if loss blew up, abort this micro and let caller skip the step
+            valid_float = valid_mask.to(dtype=token_loss.dtype)
+            token_loss = token_loss * valid_float
+            valid_counts = valid_float.sum(dim=1).clamp_min(1.0)
+            dataset_loss = token_loss.sum(dim=1) / valid_counts  # (B,)
+
+            dataset_weights = None
+            dataset_sims = None
+            if self.restart_data_selection_active and self.config.scheduler == "cosine_with_restarts":
+                with torch.no_grad():
+                    dataset_dirs = self._dataset_direction_from_logits(
+                        logits.detach(), true_for_loss, valid_mask
+                    )
+                    # Build reference direction from first full cycle.
+                    if cycle_idx == 0:
+                        self._update_reference_direction(dataset_dirs)
+                    self._try_finalize_reference_direction(cycle_idx)
+                    dataset_weights, dataset_sims = self._compute_dataset_weights(dataset_dirs, cycle_idx)
+
+            if dataset_weights is not None:
+                loss = (dataset_loss * dataset_weights).mean()
+            else:
+                loss = dataset_loss.mean()
+
+        # If loss blew up, abort this micro and let caller skip the step.
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite loss")
-            
-        
+
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
 
         with torch.no_grad():
+            pred_labels = logits.argmax(dim=-1)
+            correct = (pred_labels == true) & valid_mask
+            accuracy = correct.sum().float() / valid_mask.sum().clamp_min(1)
             micro_results = {
                 "ce": scaled_loss.item(),
-                "accuracy": (pred.argmax(dim=1) == true).float().mean().item() / num_micro_batches,
+                "accuracy": accuracy.item() / num_micro_batches,
             }
+            if dataset_weights is not None:
+                micro_results["ds_weight_mean"] = dataset_weights.mean().item() / num_micro_batches
+            if dataset_sims is not None:
+                micro_results["ds_sim_mean"] = dataset_sims.mean().item() / num_micro_batches
         return micro_results
 
     def run_batch(self, batch):
@@ -642,14 +788,15 @@ class Trainer:
             return results
 
         micro_batches = valid_micros
+        cycle_idx = self.get_restart_cycle_idx(self.curr_step)
 
         results = {"ce": 0.0, "accuracy": 0.0}
         failed = 0
         for i, micro in enumerate(micro_batches):
             try:
-                res = self.run_micro_batch(micro, i, num_micro_batches)
+                res = self.run_micro_batch(micro, i, num_micro_batches, cycle_idx)
                 for k, v in res.items():
-                    results[k] += v
+                    results[k] = results.get(k, 0.0) + v
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 torch.cuda.empty_cache()
@@ -758,6 +905,10 @@ class Trainer:
             "lr": round(lr, 5),
             # "lr_next": self.optimizer.param_groups[0]["lr"]
         })
+        if self.restart_data_selection_active:
+            results["ds_ref_ready"] = 1.0 if self.reference_direction_ is not None else 0.0
+            if cycle_idx >= 0:
+                results["cosine_cycle"] = float(cycle_idx)
         return results
 
 

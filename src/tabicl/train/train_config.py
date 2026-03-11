@@ -97,6 +97,30 @@ def build_parser():
     parser.add_argument(
         "--poly_decay_power", type=float, default=1.0, help="Power factor for polynomial decay scheduler"
     )
+    parser.add_argument(
+        "--restart_data_selection",
+        default=False,
+        type=str2bool,
+        help="Enable gradient-direction-based dataset reweighting after cosine restarts.",
+    )
+    parser.add_argument(
+        "--restart_data_selection_start_cycle",
+        type=int,
+        default=1,
+        help="Start applying dataset reweighting from this cosine cycle index (0-based).",
+    )
+    parser.add_argument(
+        "--restart_data_selection_min_weight",
+        type=float,
+        default=0.2,
+        help="Minimum per-dataset loss weight when direction similarity is low.",
+    )
+    parser.add_argument(
+        "--restart_data_selection_power",
+        type=float,
+        default=1.0,
+        help="Power used to map cosine similarity to dataset weight.",
+    )
 
     # Prior Dataset Config
     parser.add_argument(

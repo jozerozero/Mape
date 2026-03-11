@@ -92,9 +92,14 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --micro_batch_size 4 \
             --lr 2e-4 \
             --optimizer '"${OPTIMIZER}"' \
-            --scheduler cosine_warmup \
+            --scheduler cosine_with_restarts \
+            --cosine_num_cycles 5 \
             --cosine_lr_end 2e-5 \
             --warmup_proportion 0.05 \
+            --restart_data_selection True \
+            --restart_data_selection_start_cycle 1 \
+            --restart_data_selection_min_weight 0.2 \
+            --restart_data_selection_power 1.0 \
             --gradient_clipping 1.0 \
             --prior_type mix_scm \
             --prior_device cpu \
