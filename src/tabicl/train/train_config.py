@@ -55,6 +55,12 @@ def build_parser():
     # Optimization Config
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        help="Optimizer type: adamw, muon, adafactor",
+    )
+    parser.add_argument(
         "--scheduler", type=str, default="cosine_warmup", help="Learning rate scheduler: see optim.py for options."
     )
     parser.add_argument(

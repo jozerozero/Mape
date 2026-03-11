@@ -25,6 +25,7 @@ from tabicl import TabICL
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
 from tabicl.train.optim import get_scheduler
+from tabicl.train.muon import Muon
 from tabicl.train.train_config import build_parser
 from transformers.optimization import Adafactor
 
@@ -277,24 +278,6 @@ class Trainer:
 
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
-
-        # self.optimizer = optim.AdamW(
-        #     params=self.raw_model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
-        # )
-        # self.optimizer = Adafactor(
-        #     self.model.parameters(),
-        #     lr=1e-4,            # 初始学习率
-        #     eps=(1e-30, 1e-3),
-        #     clip_threshold=1.0, # AdaFactor 内部的梯度裁剪阈值
-        #     decay_rate=-0.8,
-        #     beta1=None,         # 设为 None 时不使用动量，更省显存且更稳
-        #     weight_decay=0.01,
-        #     relative_step=False, # 如果你手动设置了 Scheduler，必须设为 False
-        #     scale_parameter=False,
-        #     warmup_init=False
-        # )
-        # self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
-        """Configure optimizer and scheduler."""
         row_params = []
         other_params = []
         for name, p in self.raw_model.named_parameters():
@@ -305,16 +288,40 @@ class Trainer:
             else:
                 other_params.append(p)
 
-        # self.config.lr = self.scheduler.get_last_lr()[0]
-        self.optimizer = optim.AdamW(
-            [
-                {"params": other_params, "lr": self.config.lr},
-                {"params": row_params, "lr": self.config.lr * 1.0},
-            ],
-            weight_decay=self.config.weight_decay,
-        )
+        param_groups = [
+            {"params": other_params, "lr": self.config.lr},
+            {"params": row_params, "lr": self.config.lr * 1.0},
+        ]
+
+        optimizer_name = getattr(self.config, "optimizer", "adamw").lower()
+        if optimizer_name == "muon":
+            # Keep the same key knobs as AdamW (lr/weight_decay).
+            self.optimizer = Muon(
+                param_groups,
+                lr=self.config.lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=self.config.weight_decay,
+            )
+        elif optimizer_name == "adamw":
+            self.optimizer = optim.AdamW(param_groups, weight_decay=self.config.weight_decay)
+        elif optimizer_name == "adafactor":
+            self.optimizer = Adafactor(
+                self.model.parameters(),
+                lr=self.config.lr,
+                eps=(1e-30, 1e-3),
+                clip_threshold=1.0,
+                decay_rate=-0.8,
+                beta1=None,
+                weight_decay=self.config.weight_decay,
+                relative_step=False,
+                scale_parameter=False,
+                warmup_init=False,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
-# 然后在 train_config.py 里加一个参数（可选，但推荐）：
 
     def configure_amp(self):
         """Configure automatic mixed precision (AMP) for training."""
