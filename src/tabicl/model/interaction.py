@@ -75,8 +75,8 @@ class RowInteraction(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
-            # use_rope=False,
-            use_rope=True,
+            use_rope=False,
+            # use_rope=True,
             rope_base=rope_base,
         )
 

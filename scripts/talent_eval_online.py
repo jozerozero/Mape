@@ -45,7 +45,7 @@ if SRC_ROOT.exists():
 # ===== Fixed defaults =====
 DEFAULT_MODEL_PATH = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/Orion-MSP/stage1/checkpoint/dir2/step-27250d.ckpt"
 DEFAULT_DATA_ROOT = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/datasets"
-DEFAULT_OUTDIR = "evaluation_results_fulltrain_stage2"
+DEFAULT_OUTDIR = "evaluation_results_fulltrain_stage_rope"
 FIXED_GPUS = 8
 COERCE_NUMERIC = True
 MERGE_VAL = True

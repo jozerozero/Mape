@@ -17,7 +17,7 @@ DEFAULT_FIXED_HP = {
     "permute_features": True,
     "permute_labels": True,
     # MLPSCM and TreeSCM
-    "graph_sparsity": 0.01,
+    "graph_sparsity": 0.1,
 }
 
 DEFAULT_SAMPLED_HP = {
