@@ -23,7 +23,7 @@ import wandb
 
 from tabicl import TabICL
 from tabicl.prior.dataset import PriorDataset
-from tabicl.prior.genload import LoadPriorDataset
+from tabicl.prior.genload import LoadPriorDatasetOptimized
 from tabicl.train.optim import get_scheduler
 from tabicl.train.muon import Muon
 from tabicl.train.train_config import build_parser
@@ -253,7 +253,7 @@ class Trainer:
             )
         else:
             # Load pre-generated prior data from disk
-            dataset = LoadPriorDataset(
+            dataset = LoadPriorDatasetOptimized(
                 data_dir=self.config.prior_dir,
                 batch_size=self.config.batch_size,
                 ddp_world_size=self.ddp_world_size,
@@ -261,6 +261,7 @@ class Trainer:
                 start_from=self.config.load_prior_start,
                 delete_after_load=self.config.delete_after_load,
                 device=self.config.prior_device,
+                decode_dtype=self.config.prior_decode_dtype,
             )
 
         if self.master_process:

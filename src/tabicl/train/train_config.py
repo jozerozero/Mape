@@ -141,6 +141,13 @@ def build_parser():
         type=str2bool,
         help="Delete prior data after loading. Only used when prior_dir is set.",
     )
+    parser.add_argument(
+        "--prior_decode_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Decode dtype when loading pre-generated prior data from disk.",
+    )
     parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")

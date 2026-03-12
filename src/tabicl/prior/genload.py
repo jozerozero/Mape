@@ -44,6 +44,72 @@ warnings.filterwarnings(
 )
 
 
+_FLOAT_STORAGE_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+_INT_STORAGE_DTYPES = {
+    "int8": torch.int8,
+    "int16": torch.int16,
+}
+
+
+def parse_storage_dtype(dtype_name: str) -> torch.dtype:
+    name = str(dtype_name).lower()
+    if name in _FLOAT_STORAGE_DTYPES:
+        return _FLOAT_STORAGE_DTYPES[name]
+    if name in _INT_STORAGE_DTYPES:
+        return _INT_STORAGE_DTYPES[name]
+    raise ValueError(f"Unsupported save_dtype: {dtype_name}")
+
+
+def is_quantized_storage_dtype(dtype_name: str) -> bool:
+    return str(dtype_name).lower() in _INT_STORAGE_DTYPES
+
+
+def quantize_symmetric(x: torch.Tensor, target_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-batch quantization for 1D sparse X values."""
+    if target_dtype not in (torch.int8, torch.int16):
+        raise ValueError(f"Unsupported target dtype for quantization: {target_dtype}")
+    if x.numel() == 0:
+        return x.to(target_dtype), torch.tensor(1.0, dtype=torch.float32)
+
+    qinfo = torch.iinfo(target_dtype)
+    qmax = int(qinfo.max)
+    max_abs = torch.max(torch.abs(x)).item()
+    if max_abs <= 0:
+        scale = 1.0
+    else:
+        scale = max_abs / float(qmax)
+    q = torch.clamp(torch.round(x / scale), qinfo.min, qinfo.max).to(target_dtype)
+    return q, torch.tensor(scale, dtype=torch.float32)
+
+
+def dequantize_symmetric(x_q: torch.Tensor, scale: torch.Tensor, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    scale_v = float(scale.item()) if torch.is_tensor(scale) else float(scale)
+    return (x_q.to(torch.float32) * scale_v).to(out_dtype)
+
+
+def parse_decode_dtype(dtype_name: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype_name, torch.dtype):
+        return dtype_name
+    name = str(dtype_name).lower()
+    if name in _FLOAT_STORAGE_DTYPES:
+        return _FLOAT_STORAGE_DTYPES[name]
+    raise ValueError(f"Unsupported decode dtype: {dtype_name}. Use one of {list(_FLOAT_STORAGE_DTYPES.keys())}")
+
+
+def format_bytes(num_bytes: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.2f}{unit}"
+        value /= 1024.0
+    return f"{num_bytes:.2f}B"
+
+
 def dense2sparse(
     dense_tensor: torch.Tensor, row_lengths: torch.Tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
@@ -235,6 +301,7 @@ class LoadPriorDataset(IterableDataset):
         timeout=60,
         delete_after_load=False,
         device="cpu",
+        decode_dtype: str = "float32",
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -246,6 +313,7 @@ class LoadPriorDataset(IterableDataset):
         self.timeout = timeout
         self.delete_after_load = delete_after_load
         self.device = device
+        self.decode_dtype = parse_decode_dtype(decode_dtype)
 
         # Load metadata if available
         self.metadata = None
@@ -293,14 +361,24 @@ class LoadPriorDataset(IterableDataset):
         seq_lens = batch["seq_lens"]
         train_sizes = batch["train_sizes"]
         batch_size = batch["batch_size"]
+        x_storage_dtype = str(batch.get("x_storage_dtype", "float32")).lower()
+        x_scale = batch.get("x_scale", None)
 
         if X.is_nested:
             # Wrap nested tensors with SliceNestedTensor
             X = SliceNestedTensor(X)
             y = SliceNestedTensor(y)
         else:
+            if x_storage_dtype in _INT_STORAGE_DTYPES:
+                if x_scale is None:
+                    raise ValueError(f"Quantized batch {batch_file} is missing x_scale.")
+                X = dequantize_symmetric(X, x_scale, out_dtype=self.decode_dtype)
+            else:
+                X = X.to(self.decode_dtype)
             # Convert sparse tensor to dense
-            X = sparse2dense(X, d.repeat_interleave(seq_lens[0]), dtype=torch.float32).view(batch_size, seq_lens[0], -1)
+            X = sparse2dense(X, d.repeat_interleave(seq_lens[0]), dtype=self.decode_dtype).view(
+                batch_size, seq_lens[0], -1
+            )
 
         # Delete file if requested
         if self.delete_after_load and batch_file.exists():
@@ -434,6 +512,7 @@ class LoadPriorDataset(IterableDataset):
             f"  timeout: {self.timeout}\n"
             f"  delete_after_load: {self.delete_after_load}\n"
             f"  device: {self.device}\n"
+            f"  decode_dtype: {self.decode_dtype}\n"
         )
         if self.metadata:
             repr_str += "  Loaded Metadata:\n"
@@ -453,6 +532,17 @@ class LoadPriorDataset(IterableDataset):
         return repr_str
 
 
+class LoadPriorDatasetOptimized(LoadPriorDataset):
+    """Optimized prior-data loader that supports quantized on-disk X tensors.
+
+    This class keeps the same output contract as LoadPriorDataset:
+    (X, y, d, seq_lens, train_sizes), while transparently decoding quantized
+    X values (int8/int16 + scale) into floating tensors for training.
+    """
+
+    pass
+
+
 class SavePriorDataset:
     """Generates and saves batches of prior datasets to disk.
 
@@ -469,6 +559,10 @@ class SavePriorDataset:
         self.args = args
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dtype_name = str(args.save_dtype).lower()
+        self.save_dtype = parse_storage_dtype(self.save_dtype_name)
+        self.is_quantized = is_quantized_storage_dtype(self.save_dtype_name)
+        self.file_sizes: List[int] = []
         self.save_metadata()
 
         self.prior = PriorDataset(
@@ -509,6 +603,8 @@ class SavePriorDataset:
             "min_train_size": self.args.min_train_size,
             "max_train_size": self.args.max_train_size,
             "replay_small": self.args.replay_small,
+            "save_dtype": self.save_dtype_name,
+            "estimate_total_batches": self.args.estimate_total_batches,
         }
         with open(self.save_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
@@ -543,22 +639,32 @@ class SavePriorDataset:
             Position at which to split training and evaluation data
         """
 
+        x_scale = None
         if self.args.seq_len_per_gp:
             # X and y are nested tensors and they are already sparse
+            if self.is_quantized:
+                raise ValueError("Quantized save_dtype (int8/int16) is not supported when seq_len_per_gp=True.")
+            X = X.to(self.save_dtype)
             B = len(d)
         else:
             B, T, H = X.shape
             X = dense2sparse(X.view(-1, H), d.repeat_interleave(T), dtype=torch.float32)
+            if self.is_quantized:
+                X, x_scale = quantize_symmetric(X, self.save_dtype)
+            else:
+                X = X.to(self.save_dtype)
 
         # Create temporary file first
         batch_file = self.save_dir / f"batch_{batch_idx:06d}.pt"
         temp_file = self.save_dir / f"batch_{batch_idx:06d}.pt.tmp"
-        torch.save(
-            {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B},
-            temp_file,
-        )
+        payload = {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B}
+        payload["x_storage_dtype"] = self.save_dtype_name
+        if x_scale is not None:
+            payload["x_scale"] = x_scale
+        torch.save(payload, temp_file)
         # Atomic rename to ensure file integrity
         temp_file.replace(batch_file)
+        self.file_sizes.append(batch_file.stat().st_size)
 
     def run(self):
         """Generate and save batches of prior datasets."""
@@ -577,6 +683,36 @@ class SavePriorDataset:
             seq_lens = seq_lens.cpu()
             train_sizes = train_sizes.cpu()
             self.save_batch_sparse(batch_idx, X, y, d, seq_lens, train_sizes)
+
+        if self.file_sizes:
+            total_size = float(sum(self.file_sizes))
+            avg_size = total_size / len(self.file_sizes)
+            print(
+                f"Saved {len(self.file_sizes)} batch file(s). "
+                f"avg={format_bytes(avg_size)}, total={format_bytes(total_size)}"
+            )
+            if self.args.estimate_total_batches is not None and self.args.estimate_total_batches > 0:
+                est_total = avg_size * int(self.args.estimate_total_batches)
+                print(
+                    f"Estimated storage for {int(self.args.estimate_total_batches)} batches: "
+                    f"{format_bytes(est_total)} ({est_total / (1024**4):.3f} TB)"
+                )
+                report_path = self.save_dir / "size_estimate.json"
+                with open(report_path, "w") as f:
+                    json.dump(
+                        {
+                            "save_dtype": self.save_dtype_name,
+                            "num_measured_batches": len(self.file_sizes),
+                            "avg_batch_bytes": avg_size,
+                            "total_measured_bytes": total_size,
+                            "estimate_total_batches": int(self.args.estimate_total_batches),
+                            "estimated_total_bytes": est_total,
+                            "estimated_total_tb": est_total / (1024**4),
+                        },
+                        f,
+                        indent=2,
+                    )
+                print(f"Size report saved to {report_path}")
 
 
 if __name__ == "__main__":
@@ -603,6 +739,12 @@ if __name__ == "__main__":
     parser.add_argument("--torch_seed", type=int, default=42, help="Random seed for torch")
     parser.add_argument("--num_batches", type=int, default=10000, help="Number of batches to generate")
     parser.add_argument("--resume_from", type=int, default=0, help="Resume generation from this batch index")
+    parser.add_argument(
+        "--estimate_total_batches",
+        type=int,
+        default=None,
+        help="If set, estimate total storage using measured average batch size.",
+    )
     parser.add_argument("--batch_size", type=int, default=512, help="Total batch size")
     parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
     parser.add_argument("--min_features", type=int, default=2, help="Minimum number of features")
@@ -637,9 +779,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prior_type",
         type=str,
-        default="graph_scm",
+        default="mix_scm",
         choices=["mlp_scm", "tree_scm", "mix_scm"],
         help="Type of prior to use",
+    )
+    parser.add_argument(
+        "--save_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16", "int16", "int8"],
+        help="Storage dtype for saved X (int types use symmetric quantization).",
     )
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of jobs for parallel processing")
     parser.add_argument("--num_threads_per_generate", type=int, default=1, help="Threads per generation")
