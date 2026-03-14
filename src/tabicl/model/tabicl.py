@@ -85,6 +85,8 @@ class TabICL(nn.Module):
         row_rope_base: float = 100000,
         icl_num_blocks: int = 12,
         icl_nhead: int = 4,
+        node_icl_num_blocks: int = 2,
+        node_icl_nhead: int = 2,
         ff_factor: int = 2,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
@@ -102,6 +104,8 @@ class TabICL(nn.Module):
         self.row_rope_base = row_rope_base
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
+        self.node_icl_num_blocks = node_icl_num_blocks
+        self.node_icl_nhead = node_icl_nhead
         self.ff_factor = ff_factor
         self.dropout = dropout
         self.activation = activation
@@ -142,10 +146,26 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
         )
+        self.node_icl_predictor = ICLearning(
+            max_classes=2,
+            d_model=embed_dim,
+            num_blocks=node_icl_num_blocks,
+            nhead=node_icl_nhead,
+            dim_feedforward=embed_dim * ff_factor,
+            dropout=dropout,
+            activation=activation,
+            norm_first=norm_first,
+        )
 
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
-    ) -> Tensor:
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Optional[Tensor] = None,
+        embed_with_test: bool = False,
+        return_aux: bool = False,
+        node_y_train: Optional[Tensor] = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
         Parameters
@@ -179,13 +199,22 @@ class TabICL(nn.Module):
         if d is not None and len(d.unique()) == 1 and d[0] == H:
             d = None
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(X, d=d, train_size=None if embed_with_test else train_size), d=d
-        )
+        # Column-wise embedding
+        col_embeddings = self.col_embedder(X, d=d, train_size=None if embed_with_test else train_size)
+
+        # Row-wise interaction
+        representations = self.row_interactor(col_embeddings, d=d)
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(representations, y_train=y_train)
+
+        if return_aux:
+            feature_embeddings = col_embeddings[:, :, self.row_num_cls :, :]  # (B, T, H, E)
+            feature_embeddings = feature_embeddings.mean(dim=1)  # (B, H, E)
+            if node_y_train is None:
+                raise ValueError("node_y_train must be provided when return_aux=True.")
+            node_type_logits = self.node_icl_predictor(feature_embeddings, y_train=node_y_train)  # (B, H-Htrain, 2)
+            return out, node_type_logits
 
         return out
 
@@ -277,7 +306,9 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
-    ) -> Tensor:
+        return_aux: bool = False,
+        node_y_train: Optional[Tensor] = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -325,7 +356,14 @@ class TabICL(nn.Module):
         """
 
         if self.training:
-            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
+            out = self._train_forward(
+                X,
+                y_train,
+                d=d,
+                embed_with_test=embed_with_test,
+                return_aux=return_aux,
+                node_y_train=node_y_train,
+            )
         else:
             out = self._inference_forward(
                 X,

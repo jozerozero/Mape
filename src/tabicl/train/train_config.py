@@ -157,6 +157,30 @@ def build_parser():
         "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm"
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
+    parser.add_argument(
+        "--dag_edge_prob",
+        type=float,
+        default=None,
+        help="Override DAG edge creation probability for MLPSCM prior (0 to 1).",
+    )
+    parser.add_argument(
+        "--dag_edge_drop_prob",
+        type=float,
+        default=None,
+        help="Override post-build DAG edge drop probability for MLPSCM prior (0 to 1).",
+    )
+    parser.add_argument(
+        "--node_aux_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight for auxiliary X-node binary classification loss (MB vs Other).",
+    )
+    parser.add_argument(
+        "--node_aux_train_ratio",
+        type=float,
+        default=0.5,
+        help="Ratio of feature dimensions used as in-context labels for node auxiliary ICL branch.",
+    )
 
     ###########################################################################
     ##### Model Architecture Config ###########################################
@@ -191,6 +215,18 @@ def build_parser():
     # ICL Config
     parser.add_argument("--icl_num_blocks", type=int, default=12, help="Number of transformer blocks in ICL predictor")
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
+    parser.add_argument(
+        "--node_icl_num_blocks",
+        type=int,
+        default=2,
+        help="Number of transformer blocks in node-type auxiliary ICL predictor.",
+    )
+    parser.add_argument(
+        "--node_icl_nhead",
+        type=int,
+        default=2,
+        help="Number of attention heads in node-type auxiliary ICL predictor.",
+    )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config

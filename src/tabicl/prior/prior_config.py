@@ -16,8 +16,11 @@ DEFAULT_FIXED_HP = {
     "scale_by_max_features": False,
     "permute_features": True,
     "permute_labels": True,
-    # MLPSCM and TreeSCM
-    "graph_sparsity": 0.1,
+    # DAG sparsification controls (MLPSCM)
+    "edge_prob": 0.3,
+    "edge_drop_prob": 0.0,
+    # Legacy row-permutation sparsity is disabled by default.
+    "graph_sparsity": 0.0,
 }
 
 DEFAULT_SAMPLED_HP = {

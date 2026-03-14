@@ -279,7 +279,9 @@ class Prior:
             return 10
 
     @staticmethod
-    def delete_unique_features(X: Tensor, d: Tensor) -> Tuple[Tensor, Tensor]:
+    def delete_unique_features(
+        X: Tensor, d: Tensor, feature_binary: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """
         Removes features that have only one unique value across all samples.
 
@@ -308,23 +310,37 @@ class Prior:
             - d_new is the updated feature count per dataset
         """
 
-        def filter_unique_features(xi: Tensor, di: int) -> Tuple[Tensor, Tensor]:
+        def filter_unique_features(
+            xi: Tensor, di: int, role_i: Optional[Tensor] = None
+        ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
             """Filters features with only one unique value from a single dataset."""
             num_features = xi.shape[-1]
             # Only consider actual features (up to di, ignoring padding)
             xi = xi[:, :di]
+            if role_i is not None:
+                role_i = role_i[:di]
             # Identify features with more than one unique value (informative features)
             unique_mask = [len(torch.unique(xi[:, j])) > 1 for j in range(di)]
             di_new = sum(unique_mask)
             # Create new tensor with only informative features, padding the rest
             xi_new = F.pad(xi[:, unique_mask], pad=(0, num_features - di_new), mode="constant", value=0)
-            return xi_new, torch.tensor(di_new, device=xi.device)
+            if role_i is not None:
+                role_new = F.pad(role_i[unique_mask], pad=(0, num_features - di_new), mode="constant", value=0)
+            else:
+                role_new = None
+            return xi_new, torch.tensor(di_new, device=xi.device), role_new
 
         # Process each dataset in the batch independently
-        filtered_results = [filter_unique_features(xi, di) for xi, di in zip(X, d)]
-        X_new, d_new = [torch.stack(res) for res in zip(*filtered_results)]
+        if feature_binary is None:
+            filtered_results = [filter_unique_features(xi, di, None) for xi, di in zip(X, d)]
+        else:
+            filtered_results = [filter_unique_features(xi, di, ri) for xi, di, ri in zip(X, d, feature_binary)]
+        X_new, d_new, role_new = [list(res) for res in zip(*filtered_results)]
+        X_new = torch.stack(X_new)
+        d_new = torch.stack(d_new)
+        role_tensor = torch.stack(role_new) if feature_binary is not None else None
 
-        return X_new, d_new
+        return X_new, d_new, role_tensor
 
     @staticmethod
     def sanity_check(X: Tensor, y: Tensor, train_size: int, n_attempts: int = 10, min_classes: int = 2) -> bool:
@@ -485,6 +501,7 @@ class SCMPrior(Prior):
         prior_type: str = "mlp_scm",
         fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
         sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
+        return_x_node_binary: bool = False,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
@@ -508,6 +525,7 @@ class SCMPrior(Prior):
         self.prior_type = prior_type
         self.fixed_hp = fixed_hp
         self.sampled_hp = sampled_hp
+        self.return_x_node_binary = return_x_node_binary
         self.n_jobs = n_jobs
         self.num_threads_per_generate = num_threads_per_generate
         self.device = device
@@ -525,7 +543,7 @@ class SCMPrior(Prior):
         return hp_sampler.sample()
 
     @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, ...]:
         """
         Generates a single valid dataset based on the provided parameters.
 
@@ -552,20 +570,31 @@ class SCMPrior(Prior):
             raise ValueError(f"Unknown prior type {params['prior_type']}")
 
         while True:
-            X, y = prior_cls(**params)()
-            X, y = Reg2Cls(params)(X, y)
+            prior = prior_cls(**params)
+            X, y = prior()
+            feature_binary = getattr(prior, "last_x_binary_roles", None)
+
+            if self.return_x_node_binary and params["prior_type"] == "mlp_scm" and feature_binary is not None:
+                X, y, feature_binary = Reg2Cls(params)(X, y, feature_binary=feature_binary)
+            else:
+                X, y = Reg2Cls(params)(X, y)
+                feature_binary = torch.zeros(X.shape[1], device=X.device, dtype=torch.long) if self.return_x_node_binary else None
 
             # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
             X, y = X.unsqueeze(0), y.unsqueeze(0)
             d = torch.tensor([params["num_features"]], device=self.device, dtype=torch.long)
+            if feature_binary is not None:
+                feature_binary = feature_binary.unsqueeze(0).long()
 
             # Only keep valid datasets with sufficient features and balanced classes
-            X, d = self.delete_unique_features(X, d)
+            X, d, feature_binary = self.delete_unique_features(X, d, feature_binary=feature_binary)
             if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
+                if feature_binary is not None:
+                    return X.squeeze(0), y.squeeze(0), d.squeeze(0), feature_binary.squeeze(0)
                 return X.squeeze(0), y.squeeze(0), d.squeeze(0)
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, ...]:
         """
         Generates a batch of datasets by first creating a parameter list and then processing it.
 
@@ -687,7 +716,10 @@ class SCMPrior(Prior):
         else:
             results = [self.generate_dataset(params) for params in param_list]
 
-        X_list, y_list, d_list = zip(*results)
+        if self.return_x_node_binary:
+            X_list, y_list, d_list, x_node_binary_list = zip(*results)
+        else:
+            X_list, y_list, d_list = zip(*results)
 
         # Combine Results
         if self.seq_len_per_gp:
@@ -706,6 +738,9 @@ class SCMPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
+        if self.return_x_node_binary:
+            x_node_binary = torch.stack(x_node_binary_list).to(self.device)  # (B, max_features), 0/1
+            return X, y, d, seq_lens, train_sizes, x_node_binary
         return X, y, d, seq_lens, train_sizes
 
     def get_prior(self) -> str:
@@ -933,6 +968,7 @@ class PriorDataset(IterableDataset):
         prior_type: str = "mlp_scm",
         scm_fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
         scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
+        return_x_node_binary: bool = False,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
@@ -969,6 +1005,7 @@ class PriorDataset(IterableDataset):
                 prior_type=prior_type,
                 fixed_hp=scm_fixed_hp,
                 sampled_hp=scm_sampled_hp,
+                return_x_node_binary=return_x_node_binary,
                 n_jobs=n_jobs,
                 num_threads_per_generate=num_threads_per_generate,
                 device=device,
@@ -992,6 +1029,7 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        self.return_x_node_binary = return_x_node_binary
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """

@@ -96,8 +96,12 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --cosine_lr_end 2e-5 \
             --warmup_proportion 0.05 \
             --gradient_clipping 1.0 \
-            --prior_type mix_scm \
+            --prior_type mlp_scm \
             --prior_device cpu \
+            --dag_edge_prob 0.3 \
+            --dag_edge_drop_prob 0.2 \
+            --node_aux_loss_weight 0.5 \
+            --node_aux_train_ratio 0.5 \
             --batch_size_per_gp 4 \
             --min_features 2 \
             --max_features 100 \
@@ -115,6 +119,8 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --row_rope_base 5000 \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
+            --node_icl_num_blocks 2 \
+            --node_icl_nhead 4 \
             --ff_factor 2 \
             --norm_first True \
             --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/stabe1/checkpoint/dir2  \

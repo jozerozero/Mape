@@ -471,6 +471,17 @@ class SavePriorDataset:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.save_metadata()
 
+        scm_fixed_hp = dict(DEFAULT_FIXED_HP)
+        scm_fixed_hp["graph_sparsity"] = 0.0
+        if getattr(self.args, "dag_edge_prob", None) is not None:
+            if not (0.0 <= self.args.dag_edge_prob <= 1.0):
+                raise ValueError(f"dag_edge_prob must be in [0, 1], got {self.args.dag_edge_prob}")
+            scm_fixed_hp["edge_prob"] = float(self.args.dag_edge_prob)
+        if getattr(self.args, "dag_edge_drop_prob", None) is not None:
+            if not (0.0 <= self.args.dag_edge_drop_prob <= 1.0):
+                raise ValueError(f"dag_edge_drop_prob must be in [0, 1], got {self.args.dag_edge_drop_prob}")
+            scm_fixed_hp["edge_drop_prob"] = float(self.args.dag_edge_drop_prob)
+
         self.prior = PriorDataset(
             batch_size=self.args.batch_size,
             batch_size_per_gp=self.args.batch_size_per_gp,
@@ -485,7 +496,7 @@ class SavePriorDataset:
             max_train_size=self.args.max_train_size,
             replay_small=self.args.replay_small,
             prior_type=self.args.prior_type,
-            scm_fixed_hp=DEFAULT_FIXED_HP,
+            scm_fixed_hp=scm_fixed_hp,
             scm_sampled_hp=DEFAULT_SAMPLED_HP,
             n_jobs=self.args.n_jobs,
             num_threads_per_generate=self.args.num_threads_per_generate,
@@ -640,6 +651,18 @@ if __name__ == "__main__":
         default="graph_scm",
         choices=["mlp_scm", "tree_scm", "mix_scm"],
         help="Type of prior to use",
+    )
+    parser.add_argument(
+        "--dag_edge_prob",
+        type=float,
+        default=None,
+        help="Override DAG edge creation probability for MLPSCM prior (0 to 1).",
+    )
+    parser.add_argument(
+        "--dag_edge_drop_prob",
+        type=float,
+        default=None,
+        help="Override post-build DAG edge drop probability for MLPSCM prior (0 to 1).",
     )
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of jobs for parallel processing")
     parser.add_argument("--num_threads_per_generate", type=int, default=1, help="Threads per generation")

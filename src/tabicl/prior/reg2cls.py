@@ -279,7 +279,7 @@ class Reg2Cls(nn.Module):
         else:
             raise ValueError(f"Invalid number of classes: {num_classes}")
 
-    def forward(self, X: Tensor, y: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, X: Tensor, y: Tensor, feature_binary: Tensor | None = None) -> tuple[Tensor, ...]:
         """Processes a single dataset (X, y) according to the initialized hyperparameters.
 
         Parameters
@@ -301,7 +301,7 @@ class Reg2Cls(nn.Module):
             raise ValueError(f"Input shapes mismatch or incorrect dims. X: {X.shape}, y: {y.shape}")
 
         X = self._num2cat(X)
-        X = self._process_features(X)
+        X, feature_binary = self._process_features(X, feature_binary)
 
         y = standard_scaling(y.unsqueeze(-1)).squeeze(-1)
         if self.class_assigner is not None:
@@ -309,7 +309,9 @@ class Reg2Cls(nn.Module):
             if self.hp.get("permute_labels", True):
                 y = permute_classes(y)
 
-        return X.float(), y.float()
+        if feature_binary is None:
+            return X.float(), y.float()
+        return X.float(), y.float(), feature_binary.long()
 
     def _num2cat(self, X: Tensor) -> Tensor:
         """Converts some features to categorical based on hyperparameters.
@@ -339,7 +341,7 @@ class Reg2Cls(nn.Module):
                     X[:, col] = assigner(X[:, col]).float()
         return X
 
-    def _process_features(self, X: Tensor) -> Tensor:
+    def _process_features(self, X: Tensor, feature_binary: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         """Process inputs through outlier removal, shuffling, scaling, and padding to max features.
 
         Parameters
@@ -363,6 +365,8 @@ class Reg2Cls(nn.Module):
         if self.hp.get("permute_features", True):
             perm = torch.randperm(num_features, device=X.device)
             X = X[:, perm]
+            if feature_binary is not None:
+                feature_binary = feature_binary[perm]
 
         # Scale by the proportion of features used relative to max features
         if self.hp.get("scale_by_max_features", False):
@@ -372,5 +376,7 @@ class Reg2Cls(nn.Module):
         # Add empty features if needed to match max features
         if num_features < max_features:
             X = F.pad(X, (0, max_features - num_features), mode="constant", value=0.0)
+            if feature_binary is not None:
+                feature_binary = F.pad(feature_binary, (0, max_features - num_features), mode="constant", value=0)
 
-        return X
+        return X, feature_binary

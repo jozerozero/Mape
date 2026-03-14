@@ -24,6 +24,7 @@ import wandb
 from tabicl import TabICL
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
+from tabicl.prior.prior_config import DEFAULT_FIXED_HP
 from tabicl.train.optim import get_scheduler
 from tabicl.train.muon import Muon
 from tabicl.train.train_config import build_parser
@@ -182,6 +183,8 @@ class Trainer:
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "node_icl_num_blocks": self.config.node_icl_num_blocks,
+            "node_icl_nhead": self.config.node_icl_nhead,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
@@ -210,6 +213,9 @@ class Trainer:
             model.icl_predictor.eval()
             for param in model.icl_predictor.parameters():
                 param.requires_grad = False
+            model.node_icl_predictor.eval()
+            for param in model.node_icl_predictor.parameters():
+                param.requires_grad = False
 
         # Compile model if requested
         if self.config.model_compile:
@@ -232,6 +238,26 @@ class Trainer:
         """
 
         if self.config.prior_dir is None:
+            if self.config.node_aux_loss_weight > 0.0 and self.config.prior_type != "mlp_scm":
+                raise ValueError("node_aux_loss_weight > 0 currently requires prior_type='mlp_scm'.")
+            if self.config.node_aux_loss_weight > 0.0 and not (0.0 < self.config.node_aux_train_ratio < 1.0):
+                raise ValueError("node_aux_train_ratio must be in (0, 1) when node_aux_loss_weight > 0.")
+            scm_fixed_hp = dict(DEFAULT_FIXED_HP)
+            # Disable legacy row permutation; sparsity is now controlled at DAG edge level.
+            scm_fixed_hp["graph_sparsity"] = 0.0
+
+            if self.config.dag_edge_prob is not None:
+                if not (0.0 <= self.config.dag_edge_prob <= 1.0):
+                    raise ValueError(f"dag_edge_prob must be in [0, 1], got {self.config.dag_edge_prob}")
+                scm_fixed_hp["edge_prob"] = float(self.config.dag_edge_prob)
+
+            if self.config.dag_edge_drop_prob is not None:
+                if not (0.0 <= self.config.dag_edge_drop_prob <= 1.0):
+                    raise ValueError(
+                        f"dag_edge_drop_prob must be in [0, 1], got {self.config.dag_edge_drop_prob}"
+                    )
+                scm_fixed_hp["edge_drop_prob"] = float(self.config.dag_edge_drop_prob)
+
             # Generate prior data on the fly
             dataset = PriorDataset(
                 batch_size=self.config.batch_size,
@@ -247,10 +273,14 @@ class Trainer:
                 max_train_size=self.config.max_train_size,
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
+                scm_fixed_hp=scm_fixed_hp,
+                return_x_node_binary=self.config.node_aux_loss_weight > 0.0,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
             )
         else:
+            if self.config.node_aux_loss_weight > 0.0:
+                raise ValueError("node_aux_loss_weight > 0 requires on-the-fly prior generation (prior_dir must be None).")
             # Load pre-generated prior data from disk
             dataset = LoadPriorDataset(
                 data_dir=self.config.prior_dir,
@@ -410,7 +440,9 @@ class Trainer:
         # 按需加载
         if load_col: filter_and_load(self.raw_model.col_embedder, "col_embedder")
         if load_row: filter_and_load(self.raw_model.row_interactor, "row_interactor")
-        if load_icl: filter_and_load(self.raw_model.icl_predictor, "icl_predictor")
+        if load_icl:
+            filter_and_load(self.raw_model.icl_predictor, "icl_predictor")
+            filter_and_load(self.raw_model.node_icl_predictor, "node_icl_predictor")
 
         # Load model state
         if "state_dict" not in checkpoint:
@@ -516,12 +548,14 @@ class Trainer:
             raise ValueError("All datasets in the micro batch must have the same training size.")
         return micro_seq_len[0].item(), micro_train_size[0].item()
 
-    def align_micro_batch(self, micro_X, micro_y, micro_d, seq_len):
+    def align_micro_batch(self, micro_X, micro_y, micro_d, seq_len, micro_x_node_binary=None):
         if micro_X.shape[1] > seq_len: micro_X = micro_X[:, :seq_len]
         if micro_y.shape[1] > seq_len: micro_y = micro_y[:, :seq_len]
         max_features = micro_d.max().item()
         if micro_X.shape[-1] > max_features: micro_X = micro_X[..., :max_features]
-        return micro_X, micro_y
+        if micro_x_node_binary is not None and micro_x_node_binary.shape[-1] > max_features:
+            micro_x_node_binary = micro_x_node_binary[..., :max_features]
+        return micro_X, micro_y, micro_x_node_binary
 
     def get_module_grad_norm(self, module):
         """计算特定模块所有参数梯度的 L2 范数"""
@@ -533,48 +567,26 @@ class Trainer:
         return total_norm ** 0.5
 
     def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
-        """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        if len(micro_batch) == 6:
+            micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, micro_x_node_binary = micro_batch
+        else:
+            micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+            micro_x_node_binary = None
+
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
-        micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
+        micro_X, micro_y, micro_x_node_binary = self.align_micro_batch(
+            micro_X, micro_y, micro_d, seq_len, micro_x_node_binary=micro_x_node_binary
+        )
 
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
+        if micro_x_node_binary is not None:
+            micro_x_node_binary = micro_x_node_binary.to(self.config.device).long()
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
 
-        if self.ddp:
-            self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
-
-        with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, C)
-            pred = pred.flatten(end_dim=-2)
-            true = y_test.long().flatten()
-            loss = F.cross_entropy(pred, true)
-
-        scaled_loss = loss / num_micro_batches
-        self.scaler.scale(scaled_loss).backward()
-
-        with torch.no_grad():
-            micro_results = {"ce": scaled_loss.item(), "accuracy": (pred.argmax(dim=1) == true).float().mean().item() / num_micro_batches}
-        return micro_results
-        """
-    
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
-        seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
-        micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
-        
-        micro_X = micro_X.to(self.config.device)
-        # micro_X = torch.clamp(micro_X, min=-10.0, max=10.0)
-        micro_y = micro_y.to(self.config.device)
-        micro_d = micro_d.to(self.config.device)
-
-        y_train = micro_y[:, :train_size]
-        y_test  = micro_y[:, train_size:]
-
-        # early exit if nothing to predict
         if y_test.numel() == 0:
             return {"ce": 0.0, "accuracy": 0.0}
 
@@ -582,12 +594,23 @@ class Trainer:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            logits = self.model(micro_X, y_train, micro_d)  # (B, Ttest, C)
-            B, T, C = logits.shape
-            pred  = logits.reshape(-1, C)
-            true  = y_test.reshape(-1).long()
+            if self.config.node_aux_loss_weight > 0.0 and micro_x_node_binary is not None:
+                min_d = int(torch.min(micro_d).item())
+                node_train_size = max(1, int(min_d * float(self.config.node_aux_train_ratio)))
+                node_train_size = min(node_train_size, max(1, min_d - 1))
+                node_y_train = micro_x_node_binary[:, :node_train_size]
+                logits, node_type_logits = self.model(
+                    micro_X, y_train, micro_d, return_aux=True, node_y_train=node_y_train
+                )
+            else:
+                logits = self.model(micro_X, y_train, micro_d)
+                node_type_logits = None
+                node_train_size = 0
 
-            # drop any labels outside [0, C-1] (corrupt/padded labels)
+            _, _, C = logits.shape
+            pred = logits.reshape(-1, C)
+            true = y_test.reshape(-1).long()
+
             valid = (true >= 0) & (true < C)
             if not torch.all(valid):
                 true = true[valid]
@@ -596,12 +619,35 @@ class Trainer:
                 return {"ce": 0.0, "accuracy": 0.0}
 
             loss = F.cross_entropy(pred, true)
+            node_loss = torch.tensor(0.0, device=loss.device)
+            node_acc = torch.tensor(0.0, device=loss.device)
 
-        # if loss blew up, abort this micro and let caller skip the step
+            if self.config.node_aux_loss_weight > 0.0 and node_type_logits is not None and micro_x_node_binary is not None:
+                H_test = node_type_logits.shape[1]
+                node_target = micro_x_node_binary[:, node_train_size : node_train_size + H_test]
+                test_positions = torch.arange(node_train_size, node_train_size + H_test, device=node_target.device)
+                valid_mask = test_positions.unsqueeze(0) < micro_d.unsqueeze(1)
+                node_pred_flat = node_type_logits[valid_mask]
+                node_true_flat = node_target[valid_mask]
+                if node_true_flat.numel() > 0:
+                    node_loss = F.cross_entropy(node_pred_flat, node_true_flat)
+                    node_pred_cls = node_type_logits.argmax(dim=-1)
+                    node_acc = (node_pred_flat.argmax(dim=1) == node_true_flat).float().mean()
+                    per_ds_acc = []
+                    for bi in range(node_pred_cls.shape[0]):
+                        mask_i = valid_mask[bi]
+                        if bool(mask_i.any()):
+                            per_ds_acc.append((node_pred_cls[bi][mask_i] == node_target[bi][mask_i]).float().mean())
+                    node_acc_ds = torch.stack(per_ds_acc).mean() if per_ds_acc else torch.tensor(0.0, device=loss.device)
+                    loss = loss + self.config.node_aux_loss_weight * node_loss
+                else:
+                    node_acc_ds = torch.tensor(0.0, device=loss.device)
+            else:
+                node_acc_ds = torch.tensor(0.0, device=loss.device)
+
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite loss")
-            
-        
+
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
 
@@ -610,6 +656,10 @@ class Trainer:
                 "ce": scaled_loss.item(),
                 "accuracy": (pred.argmax(dim=1) == true).float().mean().item() / num_micro_batches,
             }
+            if self.config.node_aux_loss_weight > 0.0:
+                micro_results["node_ce"] = (node_loss / num_micro_batches).item()
+                micro_results["node_acc"] = (node_acc / num_micro_batches).item()
+                micro_results["node_acc_ds"] = (node_acc_ds / num_micro_batches).item()
         return micro_results
 
     def run_batch(self, batch):
@@ -629,7 +679,8 @@ class Trainer:
         # keep only micros that actually have ANY test rows (seq_len > train_size)
         valid_micros = []
         for mb in all_micros:
-            _, _, _, micro_seq_len, micro_train_size = mb
+            micro_seq_len = mb[3]
+            micro_train_size = mb[4]
             seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
             if seq_len > train_size:
                 valid_micros.append(mb)
@@ -649,7 +700,7 @@ class Trainer:
             try:
                 res = self.run_micro_batch(micro, i, num_micro_batches)
                 for k, v in res.items():
-                    results[k] += v
+                    results[k] = results.get(k, 0.0) + v
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 torch.cuda.empty_cache()

@@ -64,7 +64,9 @@ class MLPSCM(nn.Module):
         assert num_nodes >= num_causes + num_features + num_outputs, \
             "num_nodes 至少需要覆盖根因与 X/y 的数量。"
         self.num_nodes = num_nodes
-        self.edge_prob = random.uniform(0.1, 0.5)
+        self.edge_prob = float(edge_prob)
+        if not (0.0 <= self.edge_prob <= 1.0):
+            raise ValueError(f"edge_prob must be in [0, 1], got {self.edge_prob}")
 
         # 输入采样器（只用于根因）
         # 注意：这里假定 XSampler 在别处定义并导入，可与原实现保持一致
