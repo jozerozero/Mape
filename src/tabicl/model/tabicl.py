@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List
+import torch
 from torch import nn, Tensor
 
 from .embedding import ColEmbedding
