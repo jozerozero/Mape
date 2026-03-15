@@ -102,6 +102,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --dag_edge_drop_prob 0.2 \
             --node_aux_loss_weight 0.5 \
             --node_aux_train_ratio 0.5 \
+            --node_use_mb_rope True \
             --batch_size_per_gp 4 \
             --min_features 2 \
             --max_features 100 \

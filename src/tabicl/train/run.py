@@ -185,6 +185,7 @@ class Trainer:
             "icl_nhead": self.config.icl_nhead,
             "node_icl_num_blocks": self.config.node_icl_num_blocks,
             "node_icl_nhead": self.config.node_icl_nhead,
+            "node_use_mb_rope": self.config.node_use_mb_rope,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
@@ -242,6 +243,9 @@ class Trainer:
                 raise ValueError("node_aux_loss_weight > 0 currently requires prior_type='mlp_scm'.")
             if self.config.node_aux_loss_weight > 0.0 and not (0.0 < self.config.node_aux_train_ratio < 1.0):
                 raise ValueError("node_aux_train_ratio must be in (0, 1) when node_aux_loss_weight > 0.")
+            if self.config.node_use_mb_rope and self.config.prior_type != "mlp_scm":
+                raise ValueError("node_use_mb_rope=True currently requires prior_type='mlp_scm'.")
+            need_x_node_binary = self.config.node_aux_loss_weight > 0.0 or self.config.node_use_mb_rope
             scm_fixed_hp = dict(DEFAULT_FIXED_HP)
             # Disable legacy row permutation; sparsity is now controlled at DAG edge level.
             scm_fixed_hp["graph_sparsity"] = 0.0
@@ -274,13 +278,15 @@ class Trainer:
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
                 scm_fixed_hp=scm_fixed_hp,
-                return_x_node_binary=self.config.node_aux_loss_weight > 0.0,
+                return_x_node_binary=need_x_node_binary,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
             )
         else:
-            if self.config.node_aux_loss_weight > 0.0:
-                raise ValueError("node_aux_loss_weight > 0 requires on-the-fly prior generation (prior_dir must be None).")
+            if self.config.node_aux_loss_weight > 0.0 or self.config.node_use_mb_rope:
+                raise ValueError(
+                    "node auxiliary / MB rope requires on-the-fly prior generation (prior_dir must be None)."
+                )
             # Load pre-generated prior data from disk
             dataset = LoadPriorDataset(
                 data_dir=self.config.prior_dir,

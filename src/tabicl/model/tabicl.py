@@ -87,6 +87,7 @@ class TabICL(nn.Module):
         icl_nhead: int = 4,
         node_icl_num_blocks: int = 2,
         node_icl_nhead: int = 2,
+        node_use_mb_rope: bool = True,
         ff_factor: int = 2,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
@@ -106,6 +107,7 @@ class TabICL(nn.Module):
         self.icl_nhead = icl_nhead
         self.node_icl_num_blocks = node_icl_num_blocks
         self.node_icl_nhead = node_icl_nhead
+        self.node_use_mb_rope = node_use_mb_rope
         self.ff_factor = ff_factor
         self.dropout = dropout
         self.activation = activation
@@ -156,6 +158,9 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
         )
+        # Use MB roles as a feature-axis positional signal for node ICL:
+        # 0 -> observed non-MB, 1 -> observed MB, 2 -> unknown (to be predicted).
+        self.node_mb_role_embed = nn.Embedding(3, embed_dim)
 
     def _train_forward(
         self,
@@ -213,6 +218,12 @@ class TabICL(nn.Module):
             feature_embeddings = feature_embeddings.mean(dim=1)  # (B, H, E)
             if node_y_train is None:
                 raise ValueError("node_y_train must be provided when return_aux=True.")
+            if self.node_use_mb_rope:
+                B, H, _ = feature_embeddings.shape
+                role_ids = torch.full((B, H), 2, dtype=torch.long, device=feature_embeddings.device)
+                train_h = min(node_y_train.shape[1], H)
+                role_ids[:, :train_h] = node_y_train[:, :train_h].long().clamp_(0, 1)
+                feature_embeddings = feature_embeddings + self.node_mb_role_embed(role_ids)
             node_type_logits = self.node_icl_predictor(feature_embeddings, y_train=node_y_train)  # (B, H-Htrain, 2)
             return out, node_type_logits
 

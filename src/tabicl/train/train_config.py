@@ -181,6 +181,12 @@ def build_parser():
         default=0.5,
         help="Ratio of feature dimensions used as in-context labels for node auxiliary ICL branch.",
     )
+    parser.add_argument(
+        "--node_use_mb_rope",
+        default=True,
+        type=str2bool,
+        help="Use observed MB roles (in-MB / out-MB / unknown) as positional signal for node ICL branch.",
+    )
 
     ###########################################################################
     ##### Model Architecture Config ###########################################
