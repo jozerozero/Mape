@@ -27,6 +27,7 @@ echo "[$(date)] Starting distributed training job..."
 ########################################
 source ~/.bashrc
 source ~/slurm_tools/mi.sh
+source ~/miniconda3/etc/profile.d/conda.sh
 conda activate tabicl
 mkdir -p /tmp/$USER/comgr
 export TMPDIR=/tmp/$USER
@@ -73,7 +74,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
   # source ~/slurm_tools/mi.sh
   # conda init bash
   # conda activate tabicl
-  source "$(conda info --base)/etc/profile.d/conda.sh"
+  source ~/miniconda3/etc/profile.d/conda.sh
   conda activate tabicl
 
 
