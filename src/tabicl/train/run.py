@@ -367,12 +367,17 @@ class Trainer:
         if self.amp:
             if self.master_process:
                 print(f"Automatic Mixed Precision is enabled.")
-            # self.amp_ctx = torch.autocast(
-            #     device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
-            # )
-            self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float32
-            )
+            dtype_key = str(self.config.dtype).lower()
+            dtype_map = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
+            }
+            if dtype_key not in dtype_map:
+                raise ValueError(
+                    f"Unsupported dtype '{self.config.dtype}'. Choose from: {', '.join(dtype_map.keys())}."
+                )
+            self.amp_ctx = torch.autocast(device_type="cuda", dtype=dtype_map[dtype_key])
         else:
             self.amp_ctx = nullcontext()
 
@@ -674,7 +679,6 @@ class Trainer:
 
         # 记录本 step 用来更新参数的 lr（scheduler.step() 之前）
         lr = self.optimizer.param_groups[0]["lr"]
-        print(lr)
 
         batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
 
@@ -708,12 +712,14 @@ class Trainer:
                 for k, v in res.items():
                     results[k] = results.get(k, 0.0) + v
             except torch.cuda.OutOfMemoryError:
-                print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
+                if self.master_process:
+                    print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 torch.cuda.empty_cache()
                 failed += 1
                 continue
             except FloatingPointError:
-                print(f"Non-finite loss in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
+                if self.master_process:
+                    print(f"Non-finite loss in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 failed += 1
                 continue
 
@@ -725,9 +731,14 @@ class Trainer:
         # 2. 计算三个特定组件的梯度范数
         # 使用 self.raw_model 以确保无论是否开启 DDP 都能正确访问子模块
         with torch.no_grad():
-            gnorm_col = self.get_module_grad_norm(self.raw_model.col_embedder)
-            gnorm_row = self.get_module_grad_norm(self.raw_model.row_interactor)
-            gnorm_icl = self.get_module_grad_norm(self.raw_model.icl_predictor)
+            if self.master_process:
+                gnorm_col = self.get_module_grad_norm(self.raw_model.col_embedder)
+                gnorm_row = self.get_module_grad_norm(self.raw_model.row_interactor)
+                gnorm_icl = self.get_module_grad_norm(self.raw_model.icl_predictor)
+            else:
+                gnorm_col = 0.0
+                gnorm_row = 0.0
+                gnorm_icl = 0.0
         # 收集有 grad 的参数
         params = [p for p in self.model.parameters() if p.grad is not None]
         if len(params) == 0:
@@ -735,7 +746,6 @@ class Trainer:
             self.scaler.update()
             self.scheduler.step()
             results.update({"grad_norm_pre": 0.0, "grad_norm_post": 0.0, "lr": round(lr, 5), "lr_next": self.optimizer.param_groups[0]["lr"]})
-            print(round(lr, 5))
             return results
 
         # 计算 pre-clip grad norm
@@ -778,7 +788,6 @@ class Trainer:
             # 你原来跳过也 step scheduler，我保留（但如果你想“跳过就不走 scheduler”，把下一行注释掉）
             self.scheduler.step()
 
-            print(lr)
             results.update({
                 "grad_norm_pre": grad_norm_pre.item() if torch.isfinite(grad_norm_pre) else 0.0,
                 "grad_norm_post": grad_norm_post.item() if torch.isfinite(grad_norm_post) else 0.0,

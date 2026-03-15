@@ -44,7 +44,7 @@ NUM_NODES=${SLURM_NNODES}
 WORLD_SIZE=$(( NUM_NODES * GPUS_PER_NODE ))
 
 export MASTER_ADDR MASTER_PORT WORLD_SIZE
-export NCCL_DEBUG=INFO
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_IB_DISABLE=0
 export NCCL_P2P_DISABLE=0
 # export NCCL_ASYNC_ERROR_HANDLING=1
@@ -85,7 +85,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --wandb_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/wandb/dir \
             --wandb_mode offline \
             --device cuda \
-            --dtype float32 \
+            --dtype bfloat16 \
             --np_seed 43 \
             --torch_seed 42 \
             --max_steps 160000 \
