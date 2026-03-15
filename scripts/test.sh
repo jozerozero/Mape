@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=use_rope
+#SBATCH --job-name=mape_rop
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
@@ -13,7 +13,7 @@
 #SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
 #SBATCH --export=ALL
 #SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
-#SBATCH --nodelist=auh7-1b-gpu-[222-229,234-241,306-313]
+#SBATCH --nodelist=auh7-1b-gpu-[222-226,228-229,234]
 
 
 
