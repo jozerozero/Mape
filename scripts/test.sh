@@ -13,7 +13,7 @@
 #SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
 #SBATCH --export=ALL
 #SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
-#SBATCH --nodelist=auh7-1b-gpu-[222-226,228-229,234]
+#SBATCH --nodelist=auh7-1b-gpu-[222-229]
 
 
 
