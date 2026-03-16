@@ -614,18 +614,28 @@ class Trainer:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            if self.config.node_aux_loss_weight > 0.0 and micro_x_node_binary is not None:
+            use_mb_rope_context = self.config.node_use_mb_rope and micro_x_node_binary is not None
+            use_node_aux = self.config.node_aux_loss_weight > 0.0 and micro_x_node_binary is not None
+
+            if use_mb_rope_context:
                 min_d = int(torch.min(micro_d).item())
                 node_train_size = max(1, int(min_d * float(self.config.node_aux_train_ratio)))
                 node_train_size = min(node_train_size, max(1, min_d - 1))
                 node_y_train = micro_x_node_binary[:, :node_train_size]
+            else:
+                node_train_size = 0
+                node_y_train = None
+
+            if use_node_aux:
                 logits, node_type_logits = self.model(
                     micro_X, y_train, micro_d, return_aux=True, node_y_train=node_y_train
                 )
+            elif use_mb_rope_context:
+                logits = self.model(micro_X, y_train, micro_d, node_y_train=node_y_train)
+                node_type_logits = None
             else:
                 logits = self.model(micro_X, y_train, micro_d)
                 node_type_logits = None
-                node_train_size = 0
 
             _, _, C = logits.shape
             pred = logits.reshape(-1, C)

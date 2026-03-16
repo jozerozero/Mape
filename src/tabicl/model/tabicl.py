@@ -208,6 +208,19 @@ class TabICL(nn.Module):
         # Column-wise embedding
         col_embeddings = self.col_embedder(X, d=d, train_size=None if embed_with_test else train_size)
 
+        # Apply MB-role positional signal on feature tokens before row interaction so it can affect Y prediction.
+        if self.node_use_mb_rope and node_y_train is not None:
+            _, _, H_full, E = col_embeddings.shape
+            feature_h = H_full - self.row_num_cls
+            if feature_h > 0:
+                role_ids = torch.full((B, feature_h), 2, dtype=torch.long, device=col_embeddings.device)
+                train_h = min(node_y_train.shape[1], feature_h)
+                if train_h > 0:
+                    role_ids[:, :train_h] = node_y_train[:, :train_h].long().clamp_(0, 1)
+                role_embed = self.node_mb_role_embed(role_ids).unsqueeze(1)  # (B, 1, H, E)
+                col_embeddings = col_embeddings.clone()
+                col_embeddings[:, :, self.row_num_cls :, :] = col_embeddings[:, :, self.row_num_cls :, :] + role_embed
+
         # Row-wise interaction
         representations = self.row_interactor(col_embeddings, d=d)
 
@@ -219,12 +232,6 @@ class TabICL(nn.Module):
             feature_embeddings = feature_embeddings.mean(dim=1)  # (B, H, E)
             if node_y_train is None:
                 raise ValueError("node_y_train must be provided when return_aux=True.")
-            if self.node_use_mb_rope:
-                B, H, _ = feature_embeddings.shape
-                role_ids = torch.full((B, H), 2, dtype=torch.long, device=feature_embeddings.device)
-                train_h = min(node_y_train.shape[1], H)
-                role_ids[:, :train_h] = node_y_train[:, :train_h].long().clamp_(0, 1)
-                feature_embeddings = feature_embeddings + self.node_mb_role_embed(role_ids)
             node_type_logits = self.node_icl_predictor(feature_embeddings, y_train=node_y_train)  # (B, H-Htrain, 2)
             return out, node_type_logits
 
