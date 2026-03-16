@@ -82,6 +82,12 @@ def build_parser():
     parser.add_argument("--gradient_clipping", type=float, default=1.0, help="If > 0, clip gradients.")
     parser.add_argument("--weight_decay", type=float, default=0, help="Weight decay / L2 regularization penalty")
     parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for classification losses (applied to main and node-aux CE).",
+    )
+    parser.add_argument(
         "--cosine_num_cycles",
         type=int,
         default=5,
@@ -196,7 +202,7 @@ def build_parser():
         default="none",
         help=(
             "Pseudo-label method for MB roles: "
-            "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, or tabtransformer_probe."
+            "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, l0_resnet_probe, or tabtransformer_probe."
         ),
     )
     parser.add_argument(

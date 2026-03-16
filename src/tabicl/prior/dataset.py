@@ -328,6 +328,7 @@ def _mlp_saliency_mb(
     random_state: int = 0,
     train_steps: int = 180,
     batch_size: int = 1024,
+    grad_sparsity_lambda: float = 0.0,
 ) -> set[int]:
     """Tiny MLP probe + input-gradient saliency (GPU-capable deep baseline)."""
     n, d = int(X.shape[0]), int(X.shape[1])
@@ -356,8 +357,18 @@ def _mlp_saliency_mb(
             else:
                 idx = torch.randint(0, n, (bs,), device=device)
                 xb, yb = X_t[idx], y_t[idx]
-            pred = model(xb)
-            loss = F.mse_loss(pred, yb)
+
+            if float(grad_sparsity_lambda) > 0.0:
+                xb_req = xb.detach().clone().requires_grad_(True)
+                pred = model(xb_req)
+                fit_loss = F.mse_loss(pred, yb)
+                grad_x = torch.autograd.grad(pred.sum(), xb_req, create_graph=True)[0]
+                sparse_loss = grad_x.abs().mean()
+                loss = fit_loss + float(grad_sparsity_lambda) * sparse_loss
+            else:
+                pred = model(xb)
+                loss = F.mse_loss(pred, yb)
+
             if not torch.isfinite(loss):
                 return set()
             loss.backward()
@@ -386,6 +397,150 @@ def _mlp_saliency_mb(
     ratio = float(np.clip(0.08 + 4.0 * alpha, 0.08, 0.35))
     k = max(1, int(round(ratio * d)))
     top_idx = np.argsort(-saliency)[:k]
+    return set(int(i) for i in top_idx.tolist())
+
+
+def _l0_resnet_probe_mb(
+    X: Tensor,
+    y: Tensor,
+    alpha: float,
+    random_state: int = 0,
+    train_steps: int = 300,
+    batch_size: int = 1024,
+    l0_lambda: float = 1e-2,
+    hidden_dim: int = 192,
+    num_blocks: int = 3,
+) -> set[int]:
+    """Hard-concrete L0 gates + residual MLP probe for sparse MB discovery."""
+    n, d = int(X.shape[0]), int(X.shape[1])
+    if n < 32 or d == 0:
+        return set()
+
+    device = X.device
+    torch.manual_seed(int(random_state))
+    np.random.seed(int(random_state))
+
+    class _ResBlock(nn.Module):
+        def __init__(self, h: int):
+            super().__init__()
+            self.ln = nn.LayerNorm(h)
+            self.fc1 = nn.Linear(h, h * 2)
+            self.fc2 = nn.Linear(h * 2, h)
+
+        def forward(self, x: Tensor) -> Tensor:
+            h = self.ln(x)
+            h = F.gelu(self.fc1(h))
+            h = self.fc2(h)
+            return x + h
+
+    class _L0ResNetProbe(nn.Module):
+        def __init__(self, in_dim: int, h: int, blocks: int, lam: float):
+            super().__init__()
+            self.in_dim = in_dim
+            self.h = h
+            self.gamma = -0.1
+            self.zeta = 1.1
+            self.temperature = 0.66
+            self.l0_lambda = float(lam)
+
+            self.log_alpha = nn.Parameter(torch.full((in_dim,), -0.3))
+            self.in_proj = nn.Linear(in_dim, h)
+            self.inter_u = nn.Linear(in_dim, h, bias=False)
+            self.inter_v = nn.Linear(in_dim, h, bias=False)
+            self.blocks = nn.ModuleList([_ResBlock(h) for _ in range(max(1, int(blocks)))])
+            self.head = nn.Linear(h, 1)
+
+        def _sample_z(self, batch_size_: int) -> Tensor:
+            if self.training:
+                u = torch.rand((batch_size_, self.in_dim), device=self.log_alpha.device).clamp_(1e-6, 1.0 - 1e-6)
+                s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + self.log_alpha.unsqueeze(0)) / self.temperature)
+            else:
+                s = torch.sigmoid(self.log_alpha).unsqueeze(0).expand(batch_size_, -1)
+            s_bar = s * (self.zeta - self.gamma) + self.gamma
+            return s_bar.clamp(0.0, 1.0)
+
+        def expected_l0(self) -> Tensor:
+            logit = self.log_alpha - self.temperature * math.log(-self.gamma / self.zeta)
+            prob_nonzero = torch.sigmoid(logit)
+            return prob_nonzero.mean()
+
+        def deterministic_gate(self) -> Tensor:
+            s = torch.sigmoid(self.log_alpha)
+            return (s * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0)
+
+        def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+            z = self._sample_z(x.shape[0])
+            xg = x * z
+            h = self.in_proj(xg)
+            h = h + torch.tanh(self.inter_u(xg)) * torch.tanh(self.inter_v(xg))
+            for blk in self.blocks:
+                h = blk(h)
+            out = self.head(F.gelu(h)).squeeze(-1)
+            return out, z
+
+    model = _L0ResNetProbe(
+        in_dim=d,
+        h=max(64, int(hidden_dim)),
+        blocks=max(1, int(num_blocks)),
+        lam=float(l0_lambda),
+    ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=3e-4)
+
+    X_t = X.detach().float()
+    y_t = y.detach().float().reshape(-1)
+    bs = max(64, min(int(batch_size), n))
+
+    try:
+        model.train()
+        for _ in range(max(1, int(train_steps))):
+            opt.zero_grad(set_to_none=True)
+            if n <= bs:
+                xb, yb = X_t, y_t
+            else:
+                idx = torch.randint(0, n, (bs,), device=device)
+                xb, yb = X_t[idx], y_t[idx]
+
+            pred, _ = model(xb)
+            fit_loss = F.mse_loss(pred, yb)
+            sparse_loss = model.expected_l0()
+            loss = fit_loss + model.l0_lambda * sparse_loss
+            if not torch.isfinite(loss):
+                return set()
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        sal_n = min(n, 4096)
+        if sal_n < n:
+            idx = torch.randint(0, n, (sal_n,), device=device)
+            xg = X_t[idx].detach().clone().requires_grad_(True)
+            yg = y_t[idx]
+        else:
+            xg = X_t.detach().clone().requires_grad_(True)
+            yg = y_t
+
+        # Use deterministic gates for stable post-hoc saliency.
+        gate_det = model.deterministic_gate().detach()
+        pred, _ = model(xg)
+        loss = F.mse_loss(pred, yg)
+        loss.backward()
+        saliency = (xg.grad.abs().mean(dim=0) * xg.std(dim=0).clamp_min(1e-6)).detach()
+
+        gate_prob = torch.sigmoid(
+            model.log_alpha.detach() - model.temperature * math.log(-model.gamma / model.zeta)
+        ).clamp(0.0, 1.0)
+        scores = (0.6 * saliency + 0.4 * saliency.mean() * gate_prob) * gate_det.clamp_min(1e-4)
+        scores = scores.cpu().numpy()
+    except Exception:
+        return set()
+
+    scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+    if scores.size == 0 or float(np.max(scores)) <= 0:
+        return set()
+
+    ratio = float(np.clip(0.06 + 4.0 * alpha, 0.06, 0.35))
+    k = max(1, int(round(ratio * d)))
+    top_idx = np.argsort(-scores)[:k]
     return set(int(i) for i in top_idx.tolist())
 
 
@@ -528,6 +683,10 @@ def infer_mb_pseudo_labels(
     max_condition_set: int,
     nn_train_steps: int = 180,
     nn_batch_size: int = 1024,
+    mlp_grad_sparse_lambda: float = 0.0,
+    nn_l0_lambda: float = 1e-2,
+    nn_hidden_dim: int = 192,
+    nn_num_blocks: int = 3,
 ) -> Tensor:
     """Infer binary MB pseudo labels for each feature in X."""
     method = str(method).lower()
@@ -586,6 +745,19 @@ def infer_mb_pseudo_labels(
                 random_state=0,
                 train_steps=int(nn_train_steps),
                 batch_size=int(nn_batch_size),
+                grad_sparsity_lambda=float(mlp_grad_sparse_lambda),
+            )
+        elif method == "l0_resnet_probe":
+            selected = _l0_resnet_probe_mb(
+                x_valid_t,
+                y_t,
+                alpha=float(ci_alpha),
+                random_state=0,
+                train_steps=int(nn_train_steps),
+                batch_size=int(nn_batch_size),
+                l0_lambda=float(nn_l0_lambda),
+                hidden_dim=int(nn_hidden_dim),
+                num_blocks=int(nn_num_blocks),
             )
         elif method == "tabtransformer_probe":
             selected = _tabtransformer_probe_mb(
@@ -1101,12 +1273,13 @@ class SCMPrior(Prior):
             "mi_fdr",
             "lasso",
             "mlp_saliency",
+            "l0_resnet_probe",
             "tabtransformer_probe",
         }
         if self.node_pseudo_label_method not in valid_methods:
             raise ValueError(
                 "node_pseudo_label_method must be one of: "
-                "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, tabtransformer_probe. "
+                "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, l0_resnet_probe, tabtransformer_probe. "
                 f"Got: {self.node_pseudo_label_method}"
             )
         if not (0.0 < float(node_ci_alpha) < 1.0):

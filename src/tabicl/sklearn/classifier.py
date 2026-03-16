@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import inspect
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -320,7 +321,19 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
+        # Some checkpoints may contain extra config keys unknown to the current TabICL class.
+        ckpt_config = dict(checkpoint["config"])
+        tabicl_sig = inspect.signature(TabICL.__init__)
+        valid_keys = {k for k in tabicl_sig.parameters if k != "self"}
+        model_config = {k: v for k, v in ckpt_config.items() if k in valid_keys}
+        dropped_keys = sorted(set(ckpt_config.keys()) - set(model_config.keys()))
+        if dropped_keys:
+            warnings.warn(
+                f"Ignoring unsupported checkpoint config keys: {dropped_keys}",
+                UserWarning,
+            )
+
+        self.model_ = TabICL(**model_config)
         # self.model_.load_state_dict(checkpoint["state_dict"])
         missing, unexpected = self.model_.load_state_dict(checkpoint["state_dict"], strict=False)
         if missing or unexpected:

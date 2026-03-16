@@ -1,17 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=mape_rop
+#SBATCH --job-name=graph_class
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=2
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=180G
+#SBATCH --nodes=8                     # <<< 多机：按需修改节点数
+#SBATCH --ntasks-per-node=1            # 每节点仅启 1 个“启动器任务”
+#SBATCH --gpus-per-node=8              # 每节点 GPU 数
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=240G
 #SBATCH --time=3-00:00:00
 #SBATCH --output=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.out
 #SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
 #SBATCH --export=ALL
+#SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
+#SBATCH --nodelist=auh7-1b-gpu-[222-229,234-241,306-313]
 
 
 
@@ -53,11 +55,17 @@ export PSEUDO_METHOD=${PSEUDO_METHOD:-iamb_fdr}
 
 export PROJECT_HOME=${PROJECT_HOME:-$SLURM_SUBMIT_DIR}
 export PYTHONPATH="$PROJECT_HOME:$PYTHONPATH"
+export RUN_ROOT=${RUN_ROOT:-$PROJECT_HOME}
+
+mkdir -p "$RUN_ROOT/checkpoint" "$RUN_ROOT/wandb"
+cd "$PROJECT_HOME" || exit 1
 
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] NUM_NODES=$NUM_NODES GPUS_PER_NODE=$GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
 echo "[$(date)] OPTIMIZER=$OPTIMIZER"
 echo "[$(date)] PSEUDO_METHOD=$PSEUDO_METHOD"
+echo "[$(date)] PROJECT_HOME=$PROJECT_HOME"
+echo "[$(date)] RUN_ROOT=$RUN_ROOT"
 
 ########################################
 # 启动训练
@@ -76,13 +84,14 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
   # conda activate tabicl
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate tabicl
+  cd '"${PROJECT_HOME}"' || exit 1
 
 
-  torchrun  --nproc_per_node=${GPUS_PER_NODE} --nnodes='"${NUM_NODES}"' --node_rank=${NODE_RANK} --master_addr='"${MASTER_ADDR}"' --master_port='"${MASTER_PORT}"'  '"${PROJECT_HOME}"'/src/tabicl/train/run.py \
+  torchrun  --nproc_per_node=${GPUS_PER_NODE} --nnodes='"${NUM_NODES}"' --node_rank=${NODE_RANK} --master_addr='"${MASTER_ADDR}"' --master_port='"${MASTER_PORT}"'  src/tabicl/train/run.py \
             --wandb_log True \
             --wandb_project TabICL \
             --wandb_name Stage1 \
-            --wandb_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/wandb/dir \
+            --wandb_dir '"${RUN_ROOT}"'/wandb \
             --wandb_mode offline \
             --device cuda \
             --dtype bfloat16 \
@@ -124,16 +133,16 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --row_rope_base 5000 \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
-            --node_icl_num_blocks 2 \
+            --node_icl_num_blocks 12 \
             --node_icl_nhead 4 \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl_muon/stabe1/checkpoint/dir2  \
+            --checkpoint_dir '"${RUN_ROOT}"'/checkpoint/dir2 \
             --save_temp_every 50 \
             --save_perm_every 5000 \
             --only_load_model True \
             --freeze_col False \
-            --freeze_row False \
+            --freeze_row False
 
 
 '

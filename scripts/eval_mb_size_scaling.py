@@ -101,6 +101,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_condition_set", type=int, default=2)
     parser.add_argument("--nn_train_steps", type=int, default=180)
     parser.add_argument("--nn_batch_size", type=int, default=1024)
+    parser.add_argument(
+        "--mlp_grad_sparse_lambda",
+        type=float,
+        default=0.0,
+        help="L1 penalty weight on d(y_hat)/d(x) for mlp_saliency.",
+    )
+    parser.add_argument(
+        "--nn_l0_lambda",
+        type=float,
+        default=1e-2,
+        help="L0 sparsity weight for l0_resnet_probe.",
+    )
+    parser.add_argument("--nn_hidden_dim", type=int, default=192)
+    parser.add_argument("--nn_num_blocks", type=int, default=3)
     parser.add_argument("--cpu_threads", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     return parser
@@ -152,6 +166,10 @@ def main() -> None:
         f.write(f"max_condition_set={args.max_condition_set}\n")
         f.write(f"nn_train_steps={args.nn_train_steps}\n")
         f.write(f"nn_batch_size={args.nn_batch_size}\n")
+        f.write(f"mlp_grad_sparse_lambda={args.mlp_grad_sparse_lambda}\n")
+        f.write(f"nn_l0_lambda={args.nn_l0_lambda}\n")
+        f.write(f"nn_hidden_dim={args.nn_hidden_dim}\n")
+        f.write(f"nn_num_blocks={args.nn_num_blocks}\n")
 
     scm_fixed_hp = dict(DEFAULT_FIXED_HP)
     scm_sampled_hp = dict(DEFAULT_SAMPLED_HP)
@@ -244,6 +262,10 @@ def main() -> None:
                                 max_condition_set=args.max_condition_set,
                                 nn_train_steps=args.nn_train_steps,
                                 nn_batch_size=args.nn_batch_size,
+                                mlp_grad_sparse_lambda=args.mlp_grad_sparse_lambda,
+                                nn_l0_lambda=args.nn_l0_lambda,
+                                nn_hidden_dim=args.nn_hidden_dim,
+                                nn_num_blocks=args.nn_num_blocks,
                             ).to("cpu")
                             if method_is_gpu:
                                 torch.cuda.synchronize()

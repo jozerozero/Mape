@@ -84,6 +84,9 @@ class Trainer:
 
     def __init__(self, config):
         self.config = config
+        self.label_smoothing = float(getattr(config, "label_smoothing", 0.0))
+        if not (0.0 <= self.label_smoothing < 1.0):
+            raise ValueError(f"label_smoothing must be in [0, 1), got {self.label_smoothing}")
         self.configure_ddp()
         self.configure_wandb()
         self.build_model()
@@ -659,7 +662,7 @@ class Trainer:
             if true.numel() == 0:
                 return {"ce": 0.0, "accuracy": 0.0}
 
-            loss = F.cross_entropy(pred, true)
+            loss = F.cross_entropy(pred, true, label_smoothing=self.label_smoothing)
             node_loss = torch.tensor(0.0, device=loss.device)
             node_acc = torch.tensor(0.0, device=loss.device)
 
@@ -671,7 +674,9 @@ class Trainer:
                 node_pred_flat = node_type_logits[valid_mask]
                 node_true_flat = node_target[valid_mask]
                 if node_true_flat.numel() > 0:
-                    node_loss = F.cross_entropy(node_pred_flat, node_true_flat)
+                    node_loss = F.cross_entropy(
+                        node_pred_flat, node_true_flat, label_smoothing=self.label_smoothing
+                    )
                     node_pred_cls = node_type_logits.argmax(dim=-1)
                     node_acc = (node_pred_cls[valid_mask] == node_true_flat).float().mean()
                     correct_masked = ((node_pred_cls == node_target) & valid_mask).float()
