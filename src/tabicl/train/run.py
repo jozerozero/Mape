@@ -250,7 +250,14 @@ class Trainer:
                 raise ValueError("node_aux_train_ratio must be in (0, 1) when node_aux_loss_weight > 0.")
             if self.config.node_use_mb_rope and self.config.prior_type != "mlp_scm":
                 raise ValueError("node_use_mb_rope=True currently requires prior_type='mlp_scm'.")
-            need_x_node_binary = self.config.node_aux_loss_weight > 0.0 or self.config.node_use_mb_rope
+            pseudo_method = str(getattr(self.config, "node_pseudo_label_method", "none")).lower()
+            if pseudo_method != "none" and self.config.prior_type != "mlp_scm":
+                raise ValueError("node_pseudo_label_method requires prior_type='mlp_scm'.")
+            need_x_node_binary = (
+                self.config.node_aux_loss_weight > 0.0
+                or self.config.node_use_mb_rope
+                or pseudo_method != "none"
+            )
             scm_fixed_hp = dict(DEFAULT_FIXED_HP)
             # Disable legacy row permutation; sparsity is now controlled at DAG edge level.
             scm_fixed_hp["graph_sparsity"] = 0.0
@@ -284,13 +291,17 @@ class Trainer:
                 prior_type=self.config.prior_type,
                 scm_fixed_hp=scm_fixed_hp,
                 return_x_node_binary=need_x_node_binary,
+                node_pseudo_label_method=pseudo_method,
+                node_ci_alpha=self.config.node_ci_alpha,
+                node_ci_max_condition_set=self.config.node_ci_max_condition_set,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
             )
         else:
-            if self.config.node_aux_loss_weight > 0.0 or self.config.node_use_mb_rope:
+            pseudo_method = str(getattr(self.config, "node_pseudo_label_method", "none")).lower()
+            if self.config.node_aux_loss_weight > 0.0 or self.config.node_use_mb_rope or pseudo_method != "none":
                 raise ValueError(
-                    "node auxiliary / MB rope requires on-the-fly prior generation (prior_dir must be None)."
+                    "node auxiliary / MB rope / pseudo labels require on-the-fly prior generation (prior_dir must be None)."
                 )
             # Load pre-generated prior data from disk
             dataset = LoadPriorDataset(
@@ -587,8 +598,8 @@ class Trainer:
         return total_norm ** 0.5
 
     def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
-        if len(micro_batch) == 6:
-            micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, micro_x_node_binary = micro_batch
+        if len(micro_batch) >= 6:
+            micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, micro_x_node_binary = micro_batch[:6]
         else:
             micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
             micro_x_node_binary = None
@@ -702,6 +713,9 @@ class Trainer:
         lr = self.optimizer.param_groups[0]["lr"]
 
         batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        pseudo_mb_acc = float("nan")
+        if len(batch) >= 7 and hasattr(batch[6], "dim") and batch[6].dim() == 1:
+            pseudo_mb_acc = float(batch[6].float().mean().item())
 
         # split into micro-batches
         splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
@@ -720,12 +734,18 @@ class Trainer:
         if num_micro_batches == 0:
             # 没有反传也没更新；这里你原本就 step scheduler，我保留
             self.scheduler.step()
-            results = {"ce": 0.0, "accuracy": 0.0, "lr": lr, "lr_next": self.optimizer.param_groups[0]["lr"]}
+            results = {
+                "ce": 0.0,
+                "accuracy": 0.0,
+                "pseudo_mb_acc": pseudo_mb_acc,
+                "lr": lr,
+                "lr_next": self.optimizer.param_groups[0]["lr"],
+            }
             return results
 
         micro_batches = valid_micros
 
-        results = {"ce": 0.0, "accuracy": 0.0}
+        results = {"ce": 0.0, "accuracy": 0.0, "pseudo_mb_acc": pseudo_mb_acc}
         failed = 0
         for i, micro in enumerate(micro_batches):
             try:

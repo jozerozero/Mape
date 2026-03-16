@@ -3,17 +3,15 @@
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
-#SBATCH --nodes=8                     # <<< 多机：按需修改节点数
-#SBATCH --ntasks-per-node=1            # 每节点仅启 1 个“启动器任务”
-#SBATCH --gpus-per-node=8              # 每节点 GPU 数
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=240G
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=180G
 #SBATCH --time=3-00:00:00
 #SBATCH --output=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.out
 #SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
 #SBATCH --export=ALL
-#SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
-#SBATCH --nodelist=auh7-1b-gpu-[222-229]
 
 
 
@@ -39,7 +37,7 @@ export TMP=/tmp/$USER
 ########################################
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 MASTER_PORT=${MASTER_PORT:-29500}
-GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-2}
 NUM_NODES=${SLURM_NNODES}
 WORLD_SIZE=$(( NUM_NODES * GPUS_PER_NODE ))
 
@@ -51,6 +49,7 @@ export NCCL_P2P_DISABLE=0
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-^lo,docker0}
 export OPTIMIZER=${OPTIMIZER:-muon}
+export PSEUDO_METHOD=${PSEUDO_METHOD:-iamb_fdr}
 
 export PROJECT_HOME=${PROJECT_HOME:-$SLURM_SUBMIT_DIR}
 export PYTHONPATH="$PROJECT_HOME:$PYTHONPATH"
@@ -58,6 +57,7 @@ export PYTHONPATH="$PROJECT_HOME:$PYTHONPATH"
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] NUM_NODES=$NUM_NODES GPUS_PER_NODE=$GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE"
 echo "[$(date)] OPTIMIZER=$OPTIMIZER"
+echo "[$(date)] PSEUDO_METHOD=$PSEUDO_METHOD"
 
 ########################################
 # 启动训练
@@ -66,7 +66,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
   NODE_RANK=${SLURM_NODEID}
   echo "[${HOSTNAME}] NODE_RANK=${NODE_RANK}"
   
-  GPUS_PER_NODE=${SLURM_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-8}}
+  GPUS_PER_NODE=${SLURM_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-2}}
   echo "[${HOSTNAME}] GPUS_PER_NODE=$GPUS_PER_NODE"
   echo "[${HOSTNAME}] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
@@ -104,6 +104,9 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --node_aux_loss_weight 0.5 \
             --node_aux_train_ratio 0.5 \
             --node_use_mb_rope True \
+            --node_pseudo_label_method '"${PSEUDO_METHOD}"' \
+            --node_ci_alpha 0.01 \
+            --node_ci_max_condition_set 2 \
             --batch_size_per_gp 4 \
             --min_features 2 \
             --max_features 100 \

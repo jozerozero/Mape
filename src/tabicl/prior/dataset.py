@@ -19,10 +19,11 @@ import os
 import sys
 import math
 import warnings
+from itertools import combinations
 from typing import Dict, Tuple, Union, Optional, Any
 
 import numpy as np
-from scipy.stats import loguniform
+from scipy.stats import loguniform, t as student_t
 import joblib
 
 import torch
@@ -42,6 +43,202 @@ from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
 )
+
+
+def _partial_corr_pvalue(x: np.ndarray, y: np.ndarray, z: Optional[np.ndarray]) -> float:
+    """Return two-sided p-value for correlation between x and y conditioned on z."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(x.shape[0])
+    if n < 4:
+        return 1.0
+
+    def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        if denom <= 1e-12:
+            return 0.0
+        corr = float(np.dot(a, b) / denom)
+        return max(min(corr, 0.999999), -0.999999)
+
+    if z is None or z.size == 0:
+        x0 = x - x.mean()
+        y0 = y - y.mean()
+        r = _safe_corr(x0, y0)
+        df = n - 2
+    else:
+        z = np.asarray(z, dtype=np.float64)
+        if z.ndim == 1:
+            z = z[:, None]
+        if z.shape[0] != n:
+            return 1.0
+        zc = z - z.mean(axis=0, keepdims=True)
+        x0 = x - x.mean()
+        y0 = y - y.mean()
+        try:
+            bx, *_ = np.linalg.lstsq(zc, x0, rcond=None)
+            by, *_ = np.linalg.lstsq(zc, y0, rcond=None)
+        except np.linalg.LinAlgError:
+            return 1.0
+        rx = x0 - zc @ bx
+        ry = y0 - zc @ by
+        r = _safe_corr(rx, ry)
+        df = n - zc.shape[1] - 2
+
+    if df <= 0:
+        return 1.0
+    t_val = abs(r) * math.sqrt(df / max(1e-12, 1.0 - r * r))
+    p = float(2.0 * student_t.sf(t_val, df))
+    if not math.isfinite(p):
+        return 1.0
+    return min(max(p, 0.0), 1.0)
+
+
+def _bh_selected_indices(pvals: list[float], alpha: float) -> list[int]:
+    """Benjamini-Hochberg selected indices under FDR alpha."""
+    if not pvals:
+        return []
+    p = np.asarray(pvals, dtype=np.float64)
+    m = p.shape[0]
+    order = np.argsort(p)
+    ranked = p[order]
+    thresh = alpha * (np.arange(1, m + 1) / m)
+    passed = np.where(ranked <= thresh)[0]
+    if passed.size == 0:
+        return []
+    kmax = int(passed[-1])
+    return order[: kmax + 1].tolist()
+
+
+def _iter_condition_subsets(indices: list[int], max_k: int):
+    yield ()
+    if max_k <= 0 or not indices:
+        return
+    upper = min(max_k, len(indices))
+    for k in range(1, upper + 1):
+        for subset in combinations(indices, k):
+            yield subset
+
+
+def _iamb_fdr_mb(X: np.ndarray, y: np.ndarray, alpha: float, max_k: int) -> set[int]:
+    """Approximate IAMB-FDR with partial-correlation CI tests."""
+    d = int(X.shape[1])
+    mb: list[int] = []
+    remain = list(range(d))
+
+    while remain:
+        cond_idx = mb[-max_k:] if (max_k > 0 and len(mb) > max_k) else mb
+        z = X[:, cond_idx] if cond_idx else None
+        pvals = [_partial_corr_pvalue(X[:, j], y, z) for j in remain]
+        selected = _bh_selected_indices(pvals, alpha)
+        if not selected:
+            break
+        best_local = min(selected, key=lambda idx: pvals[idx])
+        best_feat = remain[best_local]
+        mb.append(best_feat)
+        remain.remove(best_feat)
+
+    # Backward elimination
+    changed = True
+    while changed and mb:
+        changed = False
+        for feat in list(mb):
+            cond = [j for j in mb if j != feat]
+            if max_k > 0 and len(cond) > max_k:
+                cond = cond[-max_k:]
+            z = X[:, cond] if cond else None
+            if _partial_corr_pvalue(X[:, feat], y, z) > alpha:
+                mb.remove(feat)
+                changed = True
+    return set(mb)
+
+
+def _mmpc_mb(X: np.ndarray, y: np.ndarray, alpha: float, max_k: int) -> set[int]:
+    """Approximate MMPC-style selection with bounded conditioning sets."""
+    d = int(X.shape[1])
+    cpc: list[int] = []
+    remain = list(range(d))
+
+    while remain:
+        best_feat = None
+        best_worst_p = 1.0
+        for feat in remain:
+            worst_p = 0.0
+            for subset in _iter_condition_subsets(cpc, max_k):
+                z = X[:, subset] if subset else None
+                p = _partial_corr_pvalue(X[:, feat], y, z)
+                if p > worst_p:
+                    worst_p = p
+                if worst_p >= best_worst_p:
+                    break
+            if worst_p < best_worst_p:
+                best_worst_p = worst_p
+                best_feat = feat
+
+        if best_feat is None or best_worst_p > alpha:
+            break
+        cpc.append(best_feat)
+        remain.remove(best_feat)
+
+    # Backward phase
+    for feat in list(cpc):
+        others = [j for j in cpc if j != feat]
+        independent = False
+        for subset in _iter_condition_subsets(others, max_k):
+            z = X[:, subset] if subset else None
+            if _partial_corr_pvalue(X[:, feat], y, z) > alpha:
+                independent = True
+                break
+        if independent:
+            cpc.remove(feat)
+    return set(cpc)
+
+
+def infer_mb_pseudo_labels(
+    X: Tensor,
+    y: Tensor,
+    method: str,
+    ci_alpha: float,
+    max_condition_set: int,
+) -> Tensor:
+    """Infer binary MB pseudo labels for each feature in X."""
+    method = str(method).lower()
+    if method == "none":
+        return torch.zeros(X.shape[1], dtype=torch.long, device=X.device)
+
+    x_np = X.detach().float().cpu().numpy()
+    y_np = y.detach().float().cpu().numpy().reshape(-1)
+    n, d = x_np.shape
+    pseudo = np.zeros(d, dtype=np.int64)
+    if n < 8 or d == 0:
+        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+
+    y_std = np.std(y_np)
+    if not np.isfinite(y_std) or y_std <= 1e-10:
+        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+    y_np = (y_np - y_np.mean()) / (y_std + 1e-12)
+
+    x_std = np.std(x_np, axis=0)
+    valid_idx = np.where(np.isfinite(x_std) & (x_std > 1e-10))[0]
+    if valid_idx.size == 0:
+        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+
+    x_valid = x_np[:, valid_idx]
+    x_valid = (x_valid - x_valid.mean(axis=0, keepdims=True)) / (x_valid.std(axis=0, keepdims=True) + 1e-12)
+
+    try:
+        if method == "iamb_fdr":
+            selected = _iamb_fdr_mb(x_valid, y_np, alpha=float(ci_alpha), max_k=int(max_condition_set))
+        elif method == "mmpc":
+            selected = _mmpc_mb(x_valid, y_np, alpha=float(ci_alpha), max_k=int(max_condition_set))
+        else:
+            raise ValueError(f"Unknown pseudo label method: {method}")
+    except Exception:
+        selected = set()
+
+    for idx in selected:
+        if 0 <= idx < len(valid_idx):
+            pseudo[int(valid_idx[idx])] = 1
+    return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
 
 
 class Prior:
@@ -502,6 +699,9 @@ class SCMPrior(Prior):
         fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
         sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
         return_x_node_binary: bool = False,
+        node_pseudo_label_method: str = "none",
+        node_ci_alpha: float = 0.01,
+        node_ci_max_condition_set: int = 2,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
@@ -526,6 +726,20 @@ class SCMPrior(Prior):
         self.fixed_hp = fixed_hp
         self.sampled_hp = sampled_hp
         self.return_x_node_binary = return_x_node_binary
+        self.node_pseudo_label_method = str(node_pseudo_label_method).lower()
+        if self.node_pseudo_label_method not in {"none", "iamb_fdr", "mmpc"}:
+            raise ValueError(
+                "node_pseudo_label_method must be one of: none, iamb_fdr, mmpc. "
+                f"Got: {self.node_pseudo_label_method}"
+            )
+        if not (0.0 < float(node_ci_alpha) < 1.0):
+            raise ValueError(f"node_ci_alpha must be in (0, 1), got {node_ci_alpha}")
+        if int(node_ci_max_condition_set) < 0:
+            raise ValueError(
+                f"node_ci_max_condition_set must be >= 0, got {node_ci_max_condition_set}"
+            )
+        self.node_ci_alpha = float(node_ci_alpha)
+        self.node_ci_max_condition_set = int(node_ci_max_condition_set)
         self.n_jobs = n_jobs
         self.num_threads_per_generate = num_threads_per_generate
         self.device = device
@@ -573,9 +787,21 @@ class SCMPrior(Prior):
             prior = prior_cls(**params)
             X, y = prior()
             feature_binary = getattr(prior, "last_x_binary_roles", None)
+            pseudo_mb_acc = None
 
             if self.return_x_node_binary and params["prior_type"] == "mlp_scm" and feature_binary is not None:
                 X, y, feature_binary = Reg2Cls(params)(X, y, feature_binary=feature_binary)
+                feature_binary = feature_binary.long()
+                if self.node_pseudo_label_method != "none":
+                    pseudo_binary = infer_mb_pseudo_labels(
+                        X,
+                        y,
+                        method=self.node_pseudo_label_method,
+                        ci_alpha=self.node_ci_alpha,
+                        max_condition_set=self.node_ci_max_condition_set,
+                    )
+                    pseudo_mb_acc = (pseudo_binary == feature_binary).float().mean()
+                    feature_binary = pseudo_binary
             else:
                 X, y = Reg2Cls(params)(X, y)
                 feature_binary = torch.zeros(X.shape[1], device=X.device, dtype=torch.long) if self.return_x_node_binary else None
@@ -590,6 +816,10 @@ class SCMPrior(Prior):
             X, d, feature_binary = self.delete_unique_features(X, d, feature_binary=feature_binary)
             if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
                 if feature_binary is not None:
+                    if self.node_pseudo_label_method != "none":
+                        if pseudo_mb_acc is None:
+                            pseudo_mb_acc = torch.tensor(float("nan"), device=X.device)
+                        return X.squeeze(0), y.squeeze(0), d.squeeze(0), feature_binary.squeeze(0), pseudo_mb_acc
                     return X.squeeze(0), y.squeeze(0), d.squeeze(0), feature_binary.squeeze(0)
                 return X.squeeze(0), y.squeeze(0), d.squeeze(0)
 
@@ -717,7 +947,10 @@ class SCMPrior(Prior):
             results = [self.generate_dataset(params) for params in param_list]
 
         if self.return_x_node_binary:
-            X_list, y_list, d_list, x_node_binary_list = zip(*results)
+            if self.node_pseudo_label_method != "none":
+                X_list, y_list, d_list, x_node_binary_list, pseudo_mb_acc_list = zip(*results)
+            else:
+                X_list, y_list, d_list, x_node_binary_list = zip(*results)
         else:
             X_list, y_list, d_list = zip(*results)
 
@@ -740,6 +973,9 @@ class SCMPrior(Prior):
 
         if self.return_x_node_binary:
             x_node_binary = torch.stack(x_node_binary_list).to(self.device)  # (B, max_features), 0/1
+            if self.node_pseudo_label_method != "none":
+                pseudo_mb_acc = torch.stack(pseudo_mb_acc_list).to(self.device).float()
+                return X, y, d, seq_lens, train_sizes, x_node_binary, pseudo_mb_acc
             return X, y, d, seq_lens, train_sizes, x_node_binary
         return X, y, d, seq_lens, train_sizes
 
@@ -969,6 +1205,9 @@ class PriorDataset(IterableDataset):
         scm_fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
         scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
         return_x_node_binary: bool = False,
+        node_pseudo_label_method: str = "none",
+        node_ci_alpha: float = 0.01,
+        node_ci_max_condition_set: int = 2,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
@@ -1006,6 +1245,9 @@ class PriorDataset(IterableDataset):
                 fixed_hp=scm_fixed_hp,
                 sampled_hp=scm_sampled_hp,
                 return_x_node_binary=return_x_node_binary,
+                node_pseudo_label_method=node_pseudo_label_method,
+                node_ci_alpha=node_ci_alpha,
+                node_ci_max_condition_set=node_ci_max_condition_set,
                 n_jobs=n_jobs,
                 num_threads_per_generate=num_threads_per_generate,
                 device=device,
@@ -1030,6 +1272,9 @@ class PriorDataset(IterableDataset):
         self.device = device
         self.prior_type = prior_type
         self.return_x_node_binary = return_x_node_binary
+        self.node_pseudo_label_method = str(node_pseudo_label_method).lower()
+        self.node_ci_alpha = float(node_ci_alpha)
+        self.node_ci_max_condition_set = int(node_ci_max_condition_set)
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
@@ -1109,6 +1354,7 @@ class PriorDataset(IterableDataset):
             f"  seq_len: {self.min_seq_len or 'None'} - {self.max_seq_len}\n"
             f"  sequence length varies across groups: {self.seq_len_per_gp}\n"
             f"  train_size: {self.min_train_size} - {self.max_train_size}\n"
+            f"  node_pseudo_label_method: {self.node_pseudo_label_method}\n"
             f"  device: {self.device}\n"
             f")"
         )

@@ -190,6 +190,24 @@ def build_parser():
         type=str2bool,
         help="Use observed MB roles (in-MB / out-MB / unknown) as positional signal for node ICL branch.",
     )
+    parser.add_argument(
+        "--node_pseudo_label_method",
+        type=str,
+        default="none",
+        help="Pseudo-label method for MB roles: none, iamb_fdr, or mmpc.",
+    )
+    parser.add_argument(
+        "--node_ci_alpha",
+        type=float,
+        default=0.01,
+        help="Significance level for CI tests in pseudo-label discovery.",
+    )
+    parser.add_argument(
+        "--node_ci_max_condition_set",
+        type=int,
+        default=2,
+        help="Maximum CI conditioning set size for pseudo-label discovery.",
+    )
 
     ###########################################################################
     ##### Model Architecture Config ###########################################
