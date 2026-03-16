@@ -88,7 +88,7 @@ srun --ntasks=${NUM_NODES} --ntasks-per-node=1 bash -lc '
             --dtype bfloat16 \
             --np_seed 43 \
             --torch_seed 42 \
-            --max_steps '"${MAX_STEPS:-160000}"' \
+            --max_steps 160000 \
             --batch_size 256 \
             --micro_batch_size 4 \
             --lr 2e-4 \
