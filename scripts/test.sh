@@ -3,7 +3,7 @@
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=64
