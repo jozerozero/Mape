@@ -226,7 +226,12 @@ class Trainer:
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
-            self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
+            self.model = DDP(
+                model,
+                device_ids=[self.ddp_local_rank],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=True,
+            )
             self.raw_model = self.model.module
         else:
             self.model = model
@@ -363,21 +368,25 @@ class Trainer:
         """Configure automatic mixed precision (AMP) for training."""
 
         self.amp = self.config.amp and "cuda" in self.config.device
-        self.scaler = torch.GradScaler("cuda", enabled=self.amp)
+        dtype_key = str(self.config.dtype).lower()
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        if dtype_key not in dtype_map:
+            raise ValueError(
+                f"Unsupported dtype '{self.config.dtype}'. Choose from: {', '.join(dtype_map.keys())}."
+            )
+        autocast_dtype = dtype_map[dtype_key]
+        # bfloat16 usually does not need GradScaler, keep it only for float16.
+        use_grad_scaler = self.amp and autocast_dtype == torch.float16
+        self.scaler = torch.GradScaler("cuda", enabled=use_grad_scaler)
+
         if self.amp:
             if self.master_process:
                 print(f"Automatic Mixed Precision is enabled.")
-            dtype_key = str(self.config.dtype).lower()
-            dtype_map = {
-                "float16": torch.float16,
-                "bfloat16": torch.bfloat16,
-                "float32": torch.float32,
-            }
-            if dtype_key not in dtype_map:
-                raise ValueError(
-                    f"Unsupported dtype '{self.config.dtype}'. Choose from: {', '.join(dtype_map.keys())}."
-                )
-            self.amp_ctx = torch.autocast(device_type="cuda", dtype=dtype_map[dtype_key])
+            self.amp_ctx = torch.autocast(device_type="cuda", dtype=autocast_dtype)
         else:
             self.amp_ctx = nullcontext()
 
@@ -643,13 +652,15 @@ class Trainer:
                 if node_true_flat.numel() > 0:
                     node_loss = F.cross_entropy(node_pred_flat, node_true_flat)
                     node_pred_cls = node_type_logits.argmax(dim=-1)
-                    node_acc = (node_pred_flat.argmax(dim=1) == node_true_flat).float().mean()
-                    per_ds_acc = []
-                    for bi in range(node_pred_cls.shape[0]):
-                        mask_i = valid_mask[bi]
-                        if bool(mask_i.any()):
-                            per_ds_acc.append((node_pred_cls[bi][mask_i] == node_target[bi][mask_i]).float().mean())
-                    node_acc_ds = torch.stack(per_ds_acc).mean() if per_ds_acc else torch.tensor(0.0, device=loss.device)
+                    node_acc = (node_pred_cls[valid_mask] == node_true_flat).float().mean()
+                    correct_masked = ((node_pred_cls == node_target) & valid_mask).float()
+                    valid_counts = valid_mask.sum(dim=1)
+                    has_valid = valid_counts > 0
+                    if bool(has_valid.any()):
+                        per_ds_acc = correct_masked.sum(dim=1) / valid_counts.clamp_min(1).float()
+                        node_acc_ds = per_ds_acc[has_valid].mean()
+                    else:
+                        node_acc_ds = torch.tensor(0.0, device=loss.device)
                     loss = loss + self.config.node_aux_loss_weight * node_loss
                 else:
                     node_acc_ds = torch.tensor(0.0, device=loss.device)
@@ -748,18 +759,24 @@ class Trainer:
             results.update({"grad_norm_pre": 0.0, "grad_norm_post": 0.0, "lr": round(lr, 5), "lr_next": self.optimizer.param_groups[0]["lr"]})
             return results
 
-        # 计算 pre-clip grad norm
         with torch.no_grad():
-            grad_norm_pre = torch.norm(torch.stack([p.grad.detach().norm(2) for p in params]), 2)
-
-
-        # clip（真正修改梯度，保证对更新生效）
-        if self.config.gradient_clipping > 0:
-            nn.utils.clip_grad_norm_(params, self.config.gradient_clipping)
-
-        # 计算 post-clip grad norm（这是“更新时实际用到”的梯度范数）
-        with torch.no_grad():
-            grad_norm_post = torch.norm(torch.stack([p.grad.detach().norm(2) for p in params]), 2)
+            if self.config.gradient_clipping > 0:
+                # clip_grad_norm_ returns pre-clip norm and performs clipping in the same pass.
+                pre_norm = nn.utils.clip_grad_norm_(params, self.config.gradient_clipping)
+                if not isinstance(pre_norm, torch.Tensor):
+                    grad_norm_pre = torch.tensor(float(pre_norm), device=params[0].device)
+                else:
+                    grad_norm_pre = pre_norm.detach()
+                if torch.isfinite(grad_norm_pre):
+                    grad_norm_post = torch.minimum(
+                        grad_norm_pre,
+                        torch.tensor(float(self.config.gradient_clipping), device=grad_norm_pre.device),
+                    )
+                else:
+                    grad_norm_post = grad_norm_pre
+            else:
+                grad_norm_pre = torch.norm(torch.stack([p.grad.detach().norm(2) for p in params]), 2)
+                grad_norm_post = grad_norm_pre
 
         # ---------- spike / NaN 检查（我用 post-clip 来判断更合理） ----------
         if not hasattr(self, "grad_norm_ema"):
