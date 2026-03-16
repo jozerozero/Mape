@@ -193,6 +193,7 @@ def main() -> None:
     logging.getLogger().setLevel(logging.ERROR)
     logging.getLogger("castle").setLevel(logging.ERROR)
     logging.getLogger("castle.algorithms").setLevel(logging.ERROR)
+    logging.disable(logging.INFO)
 
     has_cuda = torch.cuda.is_available()
     nonlinear_device = "gpu" if has_cuda else "cpu"
