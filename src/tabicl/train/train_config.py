@@ -194,7 +194,10 @@ def build_parser():
         "--node_pseudo_label_method",
         type=str,
         default="none",
-        help="Pseudo-label method for MB roles: none, iamb_fdr, or mmpc.",
+        help=(
+            "Pseudo-label method for MB roles: "
+            "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, or tabtransformer_probe."
+        ),
     )
     parser.add_argument(
         "--node_ci_alpha",

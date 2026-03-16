@@ -27,6 +27,7 @@ from scipy.stats import loguniform, t as student_t
 import joblib
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nested import nested_tensor
@@ -193,52 +194,417 @@ def _mmpc_mb(X: np.ndarray, y: np.ndarray, alpha: float, max_k: int) -> set[int]
     return set(cpc)
 
 
+def _is_discrete_target(y: np.ndarray) -> bool:
+    """Heuristic check whether y should be treated as a categorical target."""
+    y = np.asarray(y).reshape(-1)
+    if y.size == 0:
+        return False
+    y_round = np.rint(y)
+    int_like_ratio = float(np.mean(np.abs(y - y_round) < 1e-6))
+    if int_like_ratio < 0.99:
+        return False
+    n_unique = int(np.unique(y_round).size)
+    unique_cap = max(2, min(32, int(2 * math.sqrt(y.shape[0]))))
+    return n_unique <= unique_cap
+
+
+def _corr_fdr_mb(X: np.ndarray, y: np.ndarray, alpha: float) -> set[int]:
+    """Marginal correlation + BH-FDR."""
+    d = int(X.shape[1])
+    pvals = [_partial_corr_pvalue(X[:, j], y, None) for j in range(d)]
+    selected = _bh_selected_indices(pvals, alpha)
+    return set(selected)
+
+
+def _mi_fdr_mb(
+    X: np.ndarray,
+    y: np.ndarray,
+    alpha: float,
+    random_state: int = 0,
+    num_null_permutations: int = 6,
+) -> set[int]:
+    """Mutual-information ranking with permutation null + BH-FDR."""
+    try:
+        from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+    except Exception:
+        return set()
+
+    d = int(X.shape[1])
+    if d == 0:
+        return set()
+
+    discrete = _is_discrete_target(y)
+    if discrete:
+        y_fit = np.rint(y).astype(np.int64)
+        mi_fn = mutual_info_classif
+    else:
+        y_fit = y.astype(np.float64)
+        mi_fn = mutual_info_regression
+
+    try:
+        scores = np.asarray(mi_fn(X, y_fit, random_state=random_state), dtype=np.float64)
+    except Exception:
+        return set()
+    scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+    if scores.size == 0:
+        return set()
+
+    rng = np.random.default_rng(random_state)
+    null_chunks: list[np.ndarray] = []
+    for ridx in range(max(1, int(num_null_permutations))):
+        y_perm = rng.permutation(y_fit)
+        try:
+            null_s = np.asarray(mi_fn(X, y_perm, random_state=random_state + ridx + 1), dtype=np.float64)
+        except Exception:
+            continue
+        null_s = np.nan_to_num(null_s, nan=0.0, posinf=0.0, neginf=0.0)
+        null_chunks.append(null_s)
+
+    if not null_chunks:
+        # Fallback to top-magnitude MI if permutation null failed
+        top = int(np.argmax(scores))
+        return {top} if scores[top] > 0 else set()
+
+    null = np.concatenate(null_chunks, axis=0)
+    pvals = [float((1 + np.count_nonzero(null >= s)) / (1 + null.size)) for s in scores]
+    selected = _bh_selected_indices(pvals, alpha)
+    if selected:
+        return set(selected)
+
+    # Keep at least one feature if all p-values are conservative.
+    top = int(np.argmax(scores))
+    return {top} if scores[top] > 0 else set()
+
+
+def _lasso_mb(X: np.ndarray, y: np.ndarray, alpha: float, random_state: int = 0) -> set[int]:
+    """Sparse linear probe (L1 logistic / Lasso) as MB proxy."""
+    try:
+        from sklearn.linear_model import Lasso, LogisticRegression
+    except Exception:
+        return set()
+
+    d = int(X.shape[1])
+    if d == 0:
+        return set()
+
+    discrete = _is_discrete_target(y)
+    try:
+        if discrete:
+            y_fit = np.rint(y).astype(np.int64)
+            c_val = float(np.clip(1.0 / max(alpha, 1e-3), 0.2, 10.0))
+            model = LogisticRegression(
+                penalty="l1",
+                solver="saga",
+                C=c_val,
+                max_iter=300,
+                n_jobs=1,
+                class_weight="balanced",
+                random_state=random_state,
+            )
+            model.fit(X, y_fit)
+            coef = np.asarray(model.coef_, dtype=np.float64)
+            importance = np.abs(coef).mean(axis=0)
+        else:
+            # Use a fixed regularization level to keep inference stable/fast per dataset.
+            l1_alpha = float(np.clip(alpha * 2.0, 0.005, 0.2))
+            model = Lasso(alpha=l1_alpha, max_iter=2000, random_state=random_state)
+            model.fit(X, y.astype(np.float64))
+            importance = np.abs(np.asarray(model.coef_, dtype=np.float64))
+    except Exception:
+        return set()
+
+    importance = np.nan_to_num(importance, nan=0.0, posinf=0.0, neginf=0.0)
+    selected = np.where(importance > 1e-8)[0].tolist()
+    if selected:
+        return set(int(i) for i in selected)
+    top = int(np.argmax(importance))
+    return {top} if importance[top] > 0 else set()
+
+
+def _mlp_saliency_mb(
+    X: Tensor,
+    y: Tensor,
+    alpha: float,
+    random_state: int = 0,
+    train_steps: int = 180,
+    batch_size: int = 1024,
+) -> set[int]:
+    """Tiny MLP probe + input-gradient saliency (GPU-capable deep baseline)."""
+    n, d = int(X.shape[0]), int(X.shape[1])
+    if n < 16 or d == 0:
+        return set()
+
+    device = X.device
+    torch.manual_seed(int(random_state))
+    hidden = min(96, max(16, 2 * d))
+    model = nn.Sequential(
+        nn.Linear(d, hidden),
+        nn.SiLU(),
+        nn.Linear(hidden, 1),
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
+
+    X_t = X.detach().float()
+    y_t = y.detach().float().reshape(-1, 1)
+    bs = max(64, min(int(batch_size), n))
+
+    try:
+        for _ in range(max(1, int(train_steps))):
+            opt.zero_grad(set_to_none=True)
+            if n <= bs:
+                xb, yb = X_t, y_t
+            else:
+                idx = torch.randint(0, n, (bs,), device=device)
+                xb, yb = X_t[idx], y_t[idx]
+            pred = model(xb)
+            loss = F.mse_loss(pred, yb)
+            if not torch.isfinite(loss):
+                return set()
+            loss.backward()
+            opt.step()
+
+        sal_n = min(n, 4096)
+        if sal_n < n:
+            idx = torch.randint(0, n, (sal_n,), device=device)
+            X_req = X_t[idx].detach().clone().requires_grad_(True)
+            y_req = y_t[idx]
+        else:
+            X_req = X_t.detach().clone().requires_grad_(True)
+            y_req = y_t
+        pred = model(X_req)
+        loss = F.mse_loss(pred, y_req)
+        loss.backward()
+        saliency = (X_req.grad.abs().mean(dim=0) * X_req.std(dim=0).clamp_min(1e-6)).detach().cpu().numpy()
+    except Exception:
+        return set()
+
+    saliency = np.nan_to_num(saliency, nan=0.0, posinf=0.0, neginf=0.0)
+    if saliency.size == 0 or float(np.max(saliency)) <= 0:
+        return set()
+
+    # Keep a small adaptive top-k set; alpha controls aggressiveness.
+    ratio = float(np.clip(0.08 + 4.0 * alpha, 0.08, 0.35))
+    k = max(1, int(round(ratio * d)))
+    top_idx = np.argsort(-saliency)[:k]
+    return set(int(i) for i in top_idx.tolist())
+
+
+def _tabtransformer_probe_mb(
+    X: Tensor,
+    y: Tensor,
+    alpha: float,
+    random_state: int = 0,
+    train_steps: int = 180,
+    batch_size: int = 1024,
+) -> set[int]:
+    """Lightweight Transformer probe + gradient saliency (GPU-capable)."""
+    n, d = int(X.shape[0]), int(X.shape[1])
+    if n < 32 or d == 0:
+        return set()
+
+    device = X.device
+    torch.manual_seed(int(random_state))
+    np.random.seed(int(random_state))
+
+    X_t = X.detach().float()
+    y_t = y.detach().float().reshape(-1)
+
+    y_round = torch.round(y_t)
+    int_like_ratio = float((y_t - y_round).abs().lt(1e-6).float().mean().item())
+    n_unique = int(torch.unique(y_round).numel())
+    unique_cap = max(2, min(32, int(2 * math.sqrt(max(1, n)))))
+    is_discrete = int_like_ratio >= 0.99 and n_unique <= unique_cap
+
+    if is_discrete:
+        uniq = torch.unique(y_round).sort()[0]
+        y_cls = torch.bucketize(y_round, uniq, right=False).long()
+        num_classes = int(uniq.numel())
+        if num_classes < 2:
+            return set()
+    else:
+        y_reg = y_t
+
+    embed_dim = 64
+    nhead = 4
+    num_layers = 2
+    ff_dim = 128
+
+    class _FeatureTransformer(nn.Module):
+        def __init__(self, num_features: int, out_dim: int):
+            super().__init__()
+            self.value_proj = nn.Linear(1, embed_dim)
+            self.type_emb = nn.Parameter(torch.randn(num_features, embed_dim) * 0.02)
+            self.cls = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=nhead,
+                dim_feedforward=ff_dim,
+                dropout=0.0,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+            self.head = nn.Linear(embed_dim, out_dim)
+
+        def forward(self, x: Tensor) -> Tensor:
+            bsz = x.shape[0]
+            toks = self.value_proj(x.unsqueeze(-1))
+            toks = toks + self.type_emb.unsqueeze(0)
+            cls = self.cls.expand(bsz, -1, -1)
+            h = self.encoder(torch.cat([cls, toks], dim=1))
+            return self.head(h[:, 0])
+
+    out_dim = num_classes if is_discrete else 1
+    model = _FeatureTransformer(d, out_dim).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=5e-4)
+    bs = max(64, min(int(batch_size), n))
+
+    try:
+        for _ in range(max(1, int(train_steps))):
+            opt.zero_grad(set_to_none=True)
+            if n <= bs:
+                xb = X_t
+                if is_discrete:
+                    yb = y_cls
+                else:
+                    yb = y_reg
+            else:
+                idx = torch.randint(0, n, (bs,), device=device)
+                xb = X_t[idx]
+                if is_discrete:
+                    yb = y_cls[idx]
+                else:
+                    yb = y_reg[idx]
+
+            out = model(xb)
+            if is_discrete:
+                loss = F.cross_entropy(out, yb)
+            else:
+                loss = F.mse_loss(out.squeeze(-1), yb)
+            if not torch.isfinite(loss):
+                return set()
+            loss.backward()
+            opt.step()
+
+        sal_n = min(n, 4096)
+        if sal_n < n:
+            idx = torch.randint(0, n, (sal_n,), device=device)
+            xg = X_t[idx].detach().clone().requires_grad_(True)
+            if is_discrete:
+                yg = y_cls[idx]
+            else:
+                yg = y_reg[idx]
+        else:
+            xg = X_t.detach().clone().requires_grad_(True)
+            if is_discrete:
+                yg = y_cls
+            else:
+                yg = y_reg
+        out = model(xg)
+        if is_discrete:
+            loss = F.cross_entropy(out, yg)
+        else:
+            loss = F.mse_loss(out.squeeze(-1), yg)
+        loss.backward()
+        saliency = (xg.grad.abs().mean(dim=0) * xg.std(dim=0).clamp_min(1e-6)).detach().cpu().numpy()
+    except Exception:
+        return set()
+
+    saliency = np.nan_to_num(saliency, nan=0.0, posinf=0.0, neginf=0.0)
+    if saliency.size == 0 or float(np.max(saliency)) <= 0:
+        return set()
+
+    ratio = float(np.clip(0.08 + 4.0 * alpha, 0.08, 0.35))
+    k = max(1, int(round(ratio * d)))
+    top_idx = np.argsort(-saliency)[:k]
+    return set(int(i) for i in top_idx.tolist())
+
+
 def infer_mb_pseudo_labels(
     X: Tensor,
     y: Tensor,
     method: str,
     ci_alpha: float,
     max_condition_set: int,
+    nn_train_steps: int = 180,
+    nn_batch_size: int = 1024,
 ) -> Tensor:
     """Infer binary MB pseudo labels for each feature in X."""
     method = str(method).lower()
     if method == "none":
         return torch.zeros(X.shape[1], dtype=torch.long, device=X.device)
 
-    x_np = X.detach().float().cpu().numpy()
-    y_np = y.detach().float().cpu().numpy().reshape(-1)
-    n, d = x_np.shape
-    pseudo = np.zeros(d, dtype=np.int64)
+    x_t = X.detach().float()
+    y_t = y.detach().float().reshape(-1)
+    n, d = int(x_t.shape[0]), int(x_t.shape[1])
+    pseudo = torch.zeros(d, dtype=torch.long, device=X.device)
     if n < 8 or d == 0:
-        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+        return pseudo
 
-    y_std = np.std(y_np)
-    if not np.isfinite(y_std) or y_std <= 1e-10:
-        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
-    y_np = (y_np - y_np.mean()) / (y_std + 1e-12)
+    y_std = y_t.std(unbiased=False)
+    if (not torch.isfinite(y_std)) or float(y_std.item()) <= 1e-10:
+        return pseudo
+    y_t = (y_t - y_t.mean()) / (y_std + 1e-12)
 
-    x_std = np.std(x_np, axis=0)
-    valid_idx = np.where(np.isfinite(x_std) & (x_std > 1e-10))[0]
-    if valid_idx.size == 0:
-        return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+    x_std = x_t.std(dim=0, unbiased=False)
+    valid_mask = torch.isfinite(x_std) & (x_std > 1e-10)
+    valid_idx = torch.where(valid_mask)[0]
+    if valid_idx.numel() == 0:
+        return pseudo
 
-    x_valid = x_np[:, valid_idx]
-    x_valid = (x_valid - x_valid.mean(axis=0, keepdims=True)) / (x_valid.std(axis=0, keepdims=True) + 1e-12)
+    x_valid_t = x_t[:, valid_idx]
+    x_valid_t = (x_valid_t - x_valid_t.mean(dim=0, keepdim=True)) / (
+        x_valid_t.std(dim=0, unbiased=False, keepdim=True) + 1e-12
+    )
 
     try:
         if method == "iamb_fdr":
+            x_valid = x_valid_t.detach().cpu().numpy()
+            y_np = y_t.detach().cpu().numpy().reshape(-1)
             selected = _iamb_fdr_mb(x_valid, y_np, alpha=float(ci_alpha), max_k=int(max_condition_set))
         elif method == "mmpc":
+            x_valid = x_valid_t.detach().cpu().numpy()
+            y_np = y_t.detach().cpu().numpy().reshape(-1)
             selected = _mmpc_mb(x_valid, y_np, alpha=float(ci_alpha), max_k=int(max_condition_set))
+        elif method == "corr_fdr":
+            x_valid = x_valid_t.detach().cpu().numpy()
+            y_np = y_t.detach().cpu().numpy().reshape(-1)
+            selected = _corr_fdr_mb(x_valid, y_np, alpha=float(ci_alpha))
+        elif method == "mi_fdr":
+            x_valid = x_valid_t.detach().cpu().numpy()
+            y_np = y_t.detach().cpu().numpy().reshape(-1)
+            selected = _mi_fdr_mb(x_valid, y_np, alpha=float(ci_alpha), random_state=0)
+        elif method == "lasso":
+            x_valid = x_valid_t.detach().cpu().numpy()
+            y_np = y_t.detach().cpu().numpy().reshape(-1)
+            selected = _lasso_mb(x_valid, y_np, alpha=float(ci_alpha), random_state=0)
+        elif method == "mlp_saliency":
+            selected = _mlp_saliency_mb(
+                x_valid_t,
+                y_t,
+                alpha=float(ci_alpha),
+                random_state=0,
+                train_steps=int(nn_train_steps),
+                batch_size=int(nn_batch_size),
+            )
+        elif method == "tabtransformer_probe":
+            selected = _tabtransformer_probe_mb(
+                x_valid_t,
+                y_t,
+                alpha=float(ci_alpha),
+                random_state=0,
+                train_steps=int(nn_train_steps),
+                batch_size=int(nn_batch_size),
+            )
         else:
             raise ValueError(f"Unknown pseudo label method: {method}")
     except Exception:
         selected = set()
 
     for idx in selected:
-        if 0 <= idx < len(valid_idx):
-            pseudo[int(valid_idx[idx])] = 1
-    return torch.from_numpy(pseudo).to(device=X.device, dtype=torch.long)
+        if 0 <= idx < int(valid_idx.numel()):
+            pseudo[int(valid_idx[idx].item())] = 1
+    return pseudo
 
 
 class Prior:
@@ -727,9 +1093,20 @@ class SCMPrior(Prior):
         self.sampled_hp = sampled_hp
         self.return_x_node_binary = return_x_node_binary
         self.node_pseudo_label_method = str(node_pseudo_label_method).lower()
-        if self.node_pseudo_label_method not in {"none", "iamb_fdr", "mmpc"}:
+        valid_methods = {
+            "none",
+            "iamb_fdr",
+            "mmpc",
+            "corr_fdr",
+            "mi_fdr",
+            "lasso",
+            "mlp_saliency",
+            "tabtransformer_probe",
+        }
+        if self.node_pseudo_label_method not in valid_methods:
             raise ValueError(
-                "node_pseudo_label_method must be one of: none, iamb_fdr, mmpc. "
+                "node_pseudo_label_method must be one of: "
+                "none, iamb_fdr, mmpc, corr_fdr, mi_fdr, lasso, mlp_saliency, tabtransformer_probe. "
                 f"Got: {self.node_pseudo_label_method}"
             )
         if not (0.0 < float(node_ci_alpha) < 1.0):
