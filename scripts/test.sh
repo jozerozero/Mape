@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=use_rope
+#SBATCH --job-name=muon
 #SBATCH --partition=faculty
 #SBATCH --account=test-acc
 #SBATCH --qos=bgqos
