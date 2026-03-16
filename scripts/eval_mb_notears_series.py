@@ -110,6 +110,7 @@ def infer_mb_notears(
 
     data = standardize_cols(data)
 
+    d_all = data.shape[1]
     if method == "notears":
         learner = Notears(
             lambda1=0.05,
@@ -135,7 +136,12 @@ def infer_mb_notears(
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    learner.learn(data)
+    if method == "notears_lowrank":
+        # gCastle NotearsLowRank requires explicit rank in learn().
+        rank = max(1, min(8, d_all // 2))
+        learner.learn(data, rank=rank)
+    else:
+        learner.learn(data)
     if not hasattr(learner, "causal_matrix"):
         raise RuntimeError(f"{method} learner has no causal_matrix output")
     adj = np.asarray(learner.causal_matrix)
