@@ -1,3 +1,5 @@
+set -euo pipefail
+
 # This script is used to train TabICL for the first stage of the curriculum learning
 
 PROJECT_HOME="/vast/users/guangyi.chen/causal_group/zijian.li/zh/Mape"
@@ -24,7 +26,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --torch_seed 42 \
             --max_steps 160000 \
             --batch_size 64 \
-            --micro_batch_size 4 \
+            --micro_batch_size 1 \
             --lr 2e-4 \
             --optimizer muon \
             --scheduler cosine_warmup \
@@ -38,7 +40,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --min_features 2 \
             --max_features 100 \
             --max_classes 10 \
-            --max_seq_len 2048 \
+            --max_seq_len 1024 \
             --min_train_size 0.1 \
             --max_train_size 0.9 \
             --embed_dim 128 \
@@ -95,7 +97,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --torch_seed 42 \
             --max_steps 160000 \
             --batch_size 64 \
-            --micro_batch_size 4 \
+            --micro_batch_size 1 \
             --lr 2e-4 \
             --optimizer muon \
             --scheduler cosine_warmup \

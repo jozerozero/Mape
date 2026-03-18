@@ -334,16 +334,19 @@ class Trainer:
         """Configure automatic mixed precision (AMP) for training."""
 
         self.amp = self.config.amp and "cuda" in self.config.device
-        self.scaler = torch.GradScaler("cuda", enabled=self.amp)
+        self.use_grad_scaler = self.amp and self.config.dtype == "float16"
+        self.scaler = torch.GradScaler("cuda", enabled=self.use_grad_scaler)
         if self.amp:
             if self.master_process:
-                print(f"Automatic Mixed Precision is enabled.")
-            # self.amp_ctx = torch.autocast(
-            #     device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
-            # )
-            self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16 if self.config.dtype == "bfloat16" else torch.float32
-            )
+                if self.use_grad_scaler:
+                    print("Automatic Mixed Precision is enabled with GradScaler.")
+                else:
+                    print(f"Automatic Mixed Precision is enabled. GradScaler disabled for dtype={self.config.dtype}.")
+            autocast_dtype = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }.get(self.config.dtype, torch.float32)
+            self.amp_ctx = torch.autocast(device_type="cuda", dtype=autocast_dtype)
         else:
             self.amp_ctx = nullcontext()
 
@@ -536,6 +539,24 @@ class Trainer:
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
 
+    def skip_batch_step(self, lr, reason, results=None, successful_micro_batches=0, failed_micro_batches=0):
+        self.optimizer.zero_grad(set_to_none=True)
+        return {
+            "ce": 0.0,
+            "accuracy": 0.0,
+            "gnorm_col": 0.0,
+            "gnorm_row": 0.0,
+            "gnorm_icl": 0.0,
+            "grad_norm_pre": 0.0,
+            "grad_norm_post": 0.0,
+            "lr": round(lr, 5),
+            "skipped": True,
+            "skip_reason": reason,
+            "successful_micro_batches": successful_micro_batches,
+            "failed_micro_batches": failed_micro_batches,
+            **(results or {}),
+        }
+
     def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
         """
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
@@ -640,29 +661,45 @@ class Trainer:
 
         num_micro_batches = len(valid_micros)
         if num_micro_batches == 0:
-            # 没有反传也没更新；这里你原本就 step scheduler，我保留
-            self.scheduler.step()
-            results = {"ce": 0.0, "accuracy": 0.0, "lr": lr, "lr_next": self.optimizer.param_groups[0]["lr"]}
-            return results
+            return self.skip_batch_step(
+                lr=lr,
+                reason="no_valid_micro_batches",
+                successful_micro_batches=0,
+                failed_micro_batches=0,
+            )
 
         micro_batches = valid_micros
 
         results = {"ce": 0.0, "accuracy": 0.0}
-        failed = 0
+        successful_micro_batches = 0
+        failed_micro_batches = 0
+        skip_reason = None
         for i, micro in enumerate(micro_batches):
             try:
                 res = self.run_micro_batch(micro, i, num_micro_batches)
                 for k, v in res.items():
                     results[k] += v
+                successful_micro_batches += 1
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 torch.cuda.empty_cache()
-                failed += 1
-                continue
+                failed_micro_batches += 1
+                skip_reason = "oom"
+                break
             except FloatingPointError:
                 print(f"Non-finite loss in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
-                failed += 1
-                continue
+                failed_micro_batches += 1
+                skip_reason = "non_finite_loss"
+                break
+
+        if skip_reason is not None:
+            return self.skip_batch_step(
+                lr=lr,
+                reason=skip_reason,
+                results=results,
+                successful_micro_batches=successful_micro_batches,
+                failed_micro_batches=failed_micro_batches,
+            )
 
         # ---------- 关键：unscale -> clip -> step，保证 clip 影响本次更新 ----------
         # 先把 AMP 缩放过的梯度还原到真实尺度
@@ -678,12 +715,13 @@ class Trainer:
         # 收集有 grad 的参数
         params = [p for p in self.model.parameters() if p.grad is not None]
         if len(params) == 0:
-            # 没梯度就不更新（但你可以选择仍然 step scheduler；这里保留你的行为）
-            self.scaler.update()
-            self.scheduler.step()
-            results.update({"grad_norm_pre": 0.0, "grad_norm_post": 0.0, "lr": round(lr, 5), "lr_next": self.optimizer.param_groups[0]["lr"]})
-            print(round(lr, 5))
-            return results
+            return self.skip_batch_step(
+                lr=lr,
+                reason="no_gradients",
+                results=results,
+                successful_micro_batches=successful_micro_batches,
+                failed_micro_batches=failed_micro_batches,
+            )
 
         # 计算 pre-clip grad norm
         with torch.no_grad():
@@ -718,22 +756,18 @@ class Trainer:
                 what = "NaN/Inf" if is_nan_inf else "Spike"
                 print(f"[Warning] Step {self.curr_step}: {what} (post-clip={grad_norm_post.item():.2f}). Skipping update.")
 
-            # 清梯度，推进 scaler（避免下次 unscale 报错）
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scaler.update()
-
-            # 你原来跳过也 step scheduler，我保留（但如果你想“跳过就不走 scheduler”，把下一行注释掉）
-            self.scheduler.step()
-
-            print(lr)
             results.update({
                 "grad_norm_pre": grad_norm_pre.item() if torch.isfinite(grad_norm_pre) else 0.0,
                 "grad_norm_post": grad_norm_post.item() if torch.isfinite(grad_norm_post) else 0.0,
-                "lr": round(lr, 3),
-                # "lr_next": self.optimizer.param_groups[0]["lr"],
                 "ema": self.grad_norm_ema,
             })
-            return results
+            return self.skip_batch_step(
+                lr=lr,
+                reason="non_finite_grad_norm" if is_nan_inf else "grad_spike",
+                results=results,
+                successful_micro_batches=successful_micro_batches,
+                failed_micro_batches=failed_micro_batches,
+            )
 
         # 更新 EMA（用 post-clip）
         self.grad_norm_ema = ema_decay * self.grad_norm_ema + (1 - ema_decay) * grad_norm_post.item()
@@ -758,9 +792,12 @@ class Trainer:
             "gnorm_row": gnorm_row,
             "gnorm_icl": gnorm_icl,
             "grad_norm_pre": grad_norm_pre.item(),
-            # "grad_norm_post": grad_norm_post.item(),
+            "grad_norm_post": grad_norm_post.item(),
+            "skipped": False,
+            "skip_reason": "",
+            "successful_micro_batches": successful_micro_batches,
+            "failed_micro_batches": failed_micro_batches,
             "lr": round(lr, 5),
-            # "lr_next": self.optimizer.param_groups[0]["lr"]
         })
         return results
 
