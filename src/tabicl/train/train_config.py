@@ -42,7 +42,7 @@ def build_parser():
     ###########################################################################
     parser.add_argument("--device", default="cuda", type=str, help="Device for training: cpu, cuda, cuda:0")
     parser.add_argument(
-        "--dtype", default="float32", type=str, help="Data type (supported for float16, float32) used for training"
+        "--dtype", default="float16", type=str, help="Data type (supported for float16, float32) used for training"
     )
     parser.add_argument("--np_seed", type=int, default=42, help="Random seed for numpy")
     parser.add_argument("--torch_seed", type=int, default=42, help="Random seed for torch")
