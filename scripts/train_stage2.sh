@@ -1,124 +1,160 @@
-# This script is used to train TabICL for the second stage of the curriculum learning
+#!/bin/bash
+#SBATCH --job-name=mape_stage2
+#SBATCH --partition=faculty
+#SBATCH --account=test-acc
+#SBATCH --qos=bgqos
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=240G
+#SBATCH --time=3-00:00:00
+#SBATCH --output=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.out
+#SBATCH --error=/vast/users/guangyi.chen/causal_group/zijian.li/slurm_tools/logs/%x-%j.err
+#SBATCH --export=ALL
+#SBATCH --exclude=auh7-1b-gpu-[214-221,260-267,268-275,282-289],auh7-1b-gpu-259
+#SBATCH --nodelist=auh7-1b-gpu-[222-229,234-241,306-313]
 
-# ----------------------------------
-# Generate prior datasets on the fly
-# ----------------------------------
+set -euo pipefail
 
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
-            --wandb_log True \
-            --wandb_project TabICL \
-            --wandb_name Stage2 \
-            --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
-            --device cuda \
-            --dtype float32 \
-            --np_seed 42 \
-            --torch_seed 42 \
-            --max_steps 2000 \
-            --batch_size 512 \
-            --micro_batch_size 1 \
-            --lr 2e-5 \
-            --scheduler polynomial_decay_warmup \
-            --warmup_proportion 0 \
-            --poly_decay_lr_end 5e-6 \
-            --poly_decay_power 2.0 \
-            --gradient_clipping 1.0 \
-            --prior_type mix_scm \
-            --prior_device cpu \
-            --batch_size_per_gp 2 \
-            --min_features 2 \
-            --max_features 100 \
-            --max_classes 10 \
-            --min_seq_len 1000 \
-            --max_seq_len 40000 \
-            --log_seq_len True \
-            --seq_len_per_gp True \
-            --min_train_size 0.5 \
-            --max_train_size 0.9 \
-            --embed_dim 128 \
-            --col_num_blocks 3 \
-            --col_nhead 4 \
-            --col_num_inds 128 \
-            --row_num_blocks 3 \
-            --row_nhead 8 \
-            --row_num_cls 4 \
-            --row_rope_base 100000 \
-            --icl_num_blocks 12 \
-            --icl_nhead 4 \
-            --ff_factor 2 \
-            --norm_first True \
-            --checkpoint_dir /my/stage2/checkpoint/dir \
-            --checkpoint_path /my/stage1/checkpoint/dir/step-{latest}.ckpt \
-            --save_temp_every 5 \
-            --save_perm_every 100 \
-            --only_load_model True
+echo "[$(date)] Running on host: $(hostname)"
+echo "[$(date)] SLURM_JOB_NODELIST: ${SLURM_JOB_NODELIST:-unset}"
+echo "[$(date)] Starting distributed training job..."
 
+source ~/.bashrc
+source ~/slurm_tools/mi.sh
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate tabicl
 
-# ------------------------------------------------------
-# Save prior datasets to disk and load them for training
-# ------------------------------------------------------
+mkdir -p /tmp/$USER/comgr
+export TMPDIR=/tmp/$USER
+export TEMP=/tmp/$USER
+export TMP=/tmp/$USER
 
-# Saving to disk
-python /path/to/tabicl/prior/genload.py \
-    --save_dir /my/stage2/prior/dir \
+MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
+MASTER_PORT=${MASTER_PORT:-29500}
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-8}
+NUM_NODES=${SLURM_NNODES:-1}
+WORLD_SIZE=$(( NUM_NODES * GPUS_PER_NODE ))
+
+export MASTER_ADDR MASTER_PORT WORLD_SIZE
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=0
+export NCCL_P2P_DISABLE=0
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-^lo,docker0}
+export OPTIMIZER=${OPTIMIZER:-muon}
+
+export PROJECT_HOME=${PROJECT_HOME:-/vast/users/guangyi.chen/causal_group/zijian.li/zh/Mape}
+export PYTHONPATH="${PROJECT_HOME}/src:${PYTHONPATH:-}"
+
+OUTPUT_ROOT=${OUTPUT_ROOT:-${PROJECT_HOME}/outputs}
+STAGE1_DIR=${STAGE1_DIR:-${OUTPUT_ROOT}/stage1_v2/checkpoints}
+STAGE2_DIR=${STAGE2_DIR:-${OUTPUT_ROOT}/stage2_v2/checkpoints}
+WANDB_DIR=${WANDB_DIR:-${OUTPUT_ROOT}/stage2_v2/wandb}
+
+mkdir -p "${STAGE2_DIR}" "${WANDB_DIR}"
+
+if [[ -z "${STAGE1_CKPT:-}" ]]; then
+  STAGE1_CKPT=$(ls -1 "${STAGE1_DIR}"/step-*.ckpt 2>/dev/null | sort -V | tail -n 1 || true)
+fi
+
+if [[ -z "${STAGE1_CKPT:-}" || ! -f "${STAGE1_CKPT}" ]]; then
+  echo "[$(date)] No valid stage1 checkpoint found."
+  echo "[$(date)] Set STAGE1_CKPT explicitly or place checkpoints under ${STAGE1_DIR}."
+  exit 1
+fi
+
+echo "[$(date)] PROJECT_HOME=${PROJECT_HOME}"
+echo "[$(date)] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
+echo "[$(date)] NUM_NODES=${NUM_NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
+echo "[$(date)] OPTIMIZER=${OPTIMIZER}"
+echo "[$(date)] STAGE1_CKPT=${STAGE1_CKPT}"
+echo "[$(date)] STAGE2_DIR=${STAGE2_DIR}"
+
+srun --ntasks="${NUM_NODES}" --ntasks-per-node=1 bash -lc '
+  set -euo pipefail
+
+  NODE_RANK=${SLURM_NODEID}
+  echo "[${HOSTNAME}] NODE_RANK=${NODE_RANK}"
+
+  GPUS_PER_NODE=${SLURM_GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-8}}
+  echo "[${HOSTNAME}] GPUS_PER_NODE=${GPUS_PER_NODE}"
+  echo "[${HOSTNAME}] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+
+  source ~/.bashrc
+  source ~/slurm_tools/mi.sh
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate tabicl
+
+  torchrun \
+    --nproc_per_node="${GPUS_PER_NODE}" \
+    --nnodes='"${NUM_NODES}"' \
+    --node_rank="${NODE_RANK}" \
+    --master_addr='"${MASTER_ADDR}"' \
+    --master_port='"${MASTER_PORT}"' \
+    '"${PROJECT_HOME}"'/src/tabicl/train/run.py \
+    --wandb_log True \
+    --wandb_project Mape \
+    --wandb_name stage2-v2 \
+    --wandb_dir '"${WANDB_DIR}"' \
+    --wandb_mode offline \
+    --device cuda \
+    --dtype bfloat16 \
+    --amp True \
     --np_seed 42 \
     --torch_seed 42 \
-    --num_batches 2000 \
-    --resume_from 0 \
-    --batch_size 512 \
-    --batch_size_per_gp 2 \
+    --max_steps 50000 \
+    --batch_size 64 \
+    --micro_batch_size 1 \
+    --lr 3.5e-5 \
+    --optimizer '"${OPTIMIZER}"' \
+    --scheduler polynomial_decay_warmup \
+    --warmup_proportion 0.02 \
+    --poly_decay_lr_end 1e-5 \
+    --poly_decay_power 2.0 \
+    --gradient_clipping 1.0 \
+    --weight_decay 0.05 \
     --prior_type mix_scm \
+    --prior_device cpu \
+    --batch_size_per_gp 1 \
     --min_features 2 \
     --max_features 100 \
     --max_classes 10 \
-    --min_seq_len 1000 \
-    --max_seq_len 40000 \
+    --min_seq_len 1024 \
+    --max_seq_len 12500 \
     --log_seq_len True \
     --seq_len_per_gp True \
     --min_train_size 0.5 \
     --max_train_size 0.9 \
-    --n_jobs -1 \
-    --num_threads_per_generate 1 \
-    --device cpu
+    --embed_dim 128 \
+    --col_num_blocks 3 \
+    --col_nhead 4 \
+    --col_num_inds 128 \
+    --col_affine True \
+    --col_feature_group same \
+    --col_feature_group_size 3 \
+    --col_target_aware True \
+    --row_num_blocks 3 \
+    --row_nhead 8 \
+    --row_num_cls 4 \
+    --row_rope_base 5000 \
+    --row_last_cls_only True \
+    --icl_num_blocks 12 \
+    --icl_nhead 4 \
+    --ff_factor 2 \
+    --dropout 0.0 \
+    --norm_first True \
+    --bias_free_ln False \
+    --arch_mode v2 \
+    --checkpoint_dir '"${STAGE2_DIR}"' \
+    --checkpoint_path '"${STAGE1_CKPT}"' \
+    --save_temp_every 10 \
+    --save_perm_every 5000 \
+    --only_load_model True \
+    --freeze_col False \
+    --freeze_row False \
+    --freeze_icl False
+'
 
-# Loading from disk and training
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
-            --wandb_log True \
-            --wandb_project TabICL \
-            --wandb_name Stage2 \
-            --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
-            --device cuda \
-            --dtype float32 \
-            --np_seed 42 \
-            --torch_seed 42 \
-            --max_steps 2000 \
-            --batch_size 512 \
-            --micro_batch_size 1 \
-            --lr 2e-5 \
-            --scheduler polynomial_decay_warmup \
-            --warmup_proportion 0 \
-            --poly_decay_lr_end 5e-6 \
-            --poly_decay_power 2.0 \
-            --gradient_clipping 1.0 \
-            --prior_dir /my/stage2/prior/dir \
-            --load_prior_start 0 \
-            --delete_after_load False \
-            --prior_device cpu \
-            --embed_dim 128 \
-            --col_num_blocks 3 \
-            --col_nhead 4 \
-            --col_num_inds 128 \
-            --row_num_blocks 3 \
-            --row_nhead 8 \
-            --row_num_cls 4 \
-            --row_rope_base 100000 \
-            --icl_num_blocks 12 \
-            --icl_nhead 4 \
-            --ff_factor 2 \
-            --norm_first True \
-            --checkpoint_dir /my/stage2/checkpoint/dir \
-            --checkpoint_path /my/stage1/checkpoint/dir/step-{latest}.ckpt \
-            --save_temp_every 5 \
-            --save_perm_every 100 \
-            --only_load_model True
+echo "[$(date)] Job finished."
