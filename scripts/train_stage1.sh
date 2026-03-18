@@ -16,9 +16,14 @@
 
 set -euo pipefail
 
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+
 echo "[$(date)] Running on host: $(hostname)"
 echo "[$(date)] SLURM_JOB_NODELIST: ${SLURM_JOB_NODELIST:-unset}"
 echo "[$(date)] Starting single-node 8-GPU training job..."
+echo "[$(date)] SCRIPT_PATH=${SCRIPT_PATH}"
+echo "[$(date)] SCRIPT_DIR=${SCRIPT_DIR}"
 
 ########################################
 # 环境设置
@@ -60,6 +65,28 @@ echo "[$(date)] CHECKPOINT_DIR=${CHECKPOINT_DIR}"
 echo "[$(date)] WANDB_DIR=${WANDB_DIR}"
 echo "[$(date)] GPUS_PER_NODE=${GPUS_PER_NODE}"
 echo "[$(date)] OPTIMIZER=${OPTIMIZER}"
+
+if grep -n "/path/to/tabicl" "${SCRIPT_PATH}" >/dev/null 2>&1; then
+  echo "[ERROR] ${SCRIPT_PATH} still contains template path /path/to/tabicl"
+  exit 1
+fi
+
+if [[ "${SCRIPT_DIR}" != "${PROJECT_HOME}/scripts" ]]; then
+  echo "[ERROR] Script is not being executed from the expected repository."
+  echo "[ERROR] Expected script dir: ${PROJECT_HOME}/scripts"
+  echo "[ERROR] Actual script dir:   ${SCRIPT_DIR}"
+  exit 1
+fi
+
+if [[ ! -f "${RUN_FILE}" ]]; then
+  echo "[ERROR] Training entrypoint not found: ${RUN_FILE}"
+  exit 1
+fi
+
+python - <<'PY'
+import os
+print(f"[PYTHONPATH_CHECK] {os.environ.get('PYTHONPATH', '')}")
+PY
 
 ########################################
 # 启动训练
