@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --np_seed 43 \
             --torch_seed 42 \
             --max_steps 160000 \
-            --batch_size 128 \
+            --batch_size 64 \
             --micro_batch_size 4 \
             --lr 2e-4 \
             --optimizer muon \
@@ -69,13 +69,13 @@ python "${PRIOR_GEN_FILE}" \
     --torch_seed 42 \
     --num_batches 160000 \
     --resume_from 0 \
-    --batch_size 128 \
+    --batch_size 64 \
     --batch_size_per_gp 2 \
     --prior_type mix_scm \
     --min_features 2 \
     --max_features 100 \
     --max_classes 10 \
-    --max_seq_len 2048 \
+    --max_seq_len 1024 \
     --min_train_size 0.1 \
     --max_train_size 0.9 \
     --n_jobs -1 \
@@ -94,7 +94,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --np_seed 43 \
             --torch_seed 42 \
             --max_steps 160000 \
-            --batch_size 128 \
+            --batch_size 64 \
             --micro_batch_size 4 \
             --lr 2e-4 \
             --optimizer muon \
@@ -120,6 +120,6 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --ff_factor 2 \
             --norm_first True \
             --checkpoint_dir "${CHECKPOINT_DIR}" \
-            --save_temp_every 50 \
+            --save_temp_every 500 \
             --save_perm_every 5000 \
             --only_load_model True
