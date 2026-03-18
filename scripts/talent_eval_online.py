@@ -420,7 +420,13 @@ def build_classifier(
                 kwargs["torch_compile_dynamic"] = torch_compile_dynamic
     except Exception:
         pass
-    return TabICLClassifier(**kwargs)
+    clf = TabICLClassifier(**kwargs)
+    try:
+        fit_sig = inspect.signature(TabICLClassifier.fit)
+        clf._codex_kv_cache = "kv" if "kv_cache" in fit_sig.parameters else None
+    except Exception:
+        clf._codex_kv_cache = None
+    return clf
 
 
 def preload_model_once(clf, gpu_device: str) -> None:
@@ -671,7 +677,10 @@ def _worker_loop(
             prep_time = time.perf_counter() - ds_t0
 
             t_fit = time.perf_counter()
-            clf.fit(X_train, y_train)
+            if getattr(clf, "_codex_kv_cache", None) is not None:
+                clf.fit(X_train, y_train, kv_cache=clf._codex_kv_cache)
+            else:
+                clf.fit(X_train, y_train)
             fit_time = time.perf_counter() - t_fit
 
             t_pred = time.perf_counter()

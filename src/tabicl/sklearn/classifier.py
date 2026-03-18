@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import warnings
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -18,7 +19,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 from .preprocessing import TransformToNumerical, EnsembleGenerator
 from .sklearn_utils import validate_data
 from tabicl import InferenceConfig
-from tabicl import TabICL
+from tabicl import TabICL, TabICLCache
 
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
@@ -319,17 +320,25 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         assert "config" in checkpoint, "The checkpoint doesn't contain the model configuration."
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
+        config = self._normalize_checkpoint_config(checkpoint["config"])
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
-        # self.model_.load_state_dict(checkpoint["state_dict"])
-        missing, unexpected = self.model_.load_state_dict(checkpoint["state_dict"], strict=False)
-        if missing or unexpected:
-            print(f"missing: {missing}")
-            print(f"unexpected: {unexpected}")
-
+        self.model_ = TabICL(**config)
+        self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
 
-    def fit(self, X, y):
+    def _normalize_checkpoint_config(self, config: Dict) -> Dict:
+        config = dict(config)
+        legacy = "arch_mode" not in config
+        config.setdefault("arch_mode", "legacy" if legacy else config["arch_mode"])
+        config.setdefault("col_affine", True)
+        config.setdefault("col_feature_group", False)
+        config.setdefault("col_feature_group_size", 3)
+        config.setdefault("col_target_aware", False)
+        config.setdefault("row_last_cls_only", False)
+        config.setdefault("bias_free_ln", False)
+        return config
+
+    def fit(self, X, y, kv_cache: bool | str = False):
         """Fit the classifier to training data.
 
         Prepares the model for prediction by:
@@ -348,6 +357,11 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
         y : array-like of shape (n_samples,)
             Training target labels.
+
+        kv_cache : bool or {"kv", "repr"}, default=False
+            Whether to pre-compute training-side caches for faster prediction.
+            ``True`` is treated as ``"kv"``. For legacy checkpoints, ``"repr"``
+            automatically falls back to ``"kv"``.
 
         Returns
         -------
@@ -432,7 +446,82 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         )
         self.ensemble_generator_.fit(X, y)
 
+        self.model_kv_cache_ = None
+        self.cache_mode_ = None
+        if kv_cache:
+            if kv_cache is True:
+                requested_cache_mode = "kv"
+            elif kv_cache in {"kv", "repr"}:
+                requested_cache_mode = kv_cache
+            else:
+                raise ValueError(f"Invalid kv_cache value '{kv_cache}'. Expected False, True, 'kv', or 'repr'.")
+
+            if self.n_classes_ > self.model_.max_classes:
+                raise ValueError("KV caching is not supported when the number of classes exceeds model.max_classes.")
+
+            if self.model_.arch_mode == "legacy" and requested_cache_mode == "repr":
+                requested_cache_mode = "kv"
+
+            self.cache_mode_ = requested_cache_mode
+            self._build_kv_cache()
+
         return self
+
+    def _build_kv_cache(self) -> None:
+        train_data = self._prepare_train_cache_data()
+        self.model_kv_cache_ = OrderedDict()
+
+        for norm_method, (Xs, ys) in train_data.items():
+            batch_size = self.batch_size or Xs.shape[0]
+            n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+            X_batches = np.array_split(Xs, n_batches)
+            y_batches = np.array_split(ys, n_batches)
+            caches = []
+
+            for X_batch, y_batch in zip(X_batches, y_batches):
+                X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+                y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+                with torch.no_grad():
+                    self.model_.forward_with_cache(
+                        X_train=X_batch,
+                        y_train=y_batch,
+                        use_cache=False,
+                        store_cache=True,
+                        cache_mode=self.cache_mode_,
+                        inference_config=self.inference_config_,
+                    )
+                caches.append(self.model_._cache)
+                self.model_.clear_cache()
+
+            self.model_kv_cache_[norm_method] = TabICLCache.concat(caches)
+
+    def _prepare_train_cache_data(self):
+        data = OrderedDict()
+        X_train = self.ensemble_generator_.X_
+        y_train = self.ensemble_generator_.y_
+
+        for norm_method, configs in self.ensemble_generator_.ensemble_configs_.items():
+            preprocessor = self.ensemble_generator_.preprocessors_[norm_method]
+            X_variant = preprocessor.X_transformed_
+            X_ensemble = []
+            y_ensemble = []
+            for shuffle_pattern, shift_offset in configs:
+                X_ensemble.append(X_variant[:, shuffle_pattern])
+                y_ensemble.append((y_train + shift_offset) % self.n_classes_)
+            data[norm_method] = (np.stack(X_ensemble, axis=0), np.stack(y_ensemble, axis=0))
+
+        return data
+
+    def _prepare_test_cache_data(self, X):
+        data = OrderedDict()
+        for norm_method, configs in self.ensemble_generator_.ensemble_configs_.items():
+            preprocessor = self.ensemble_generator_.preprocessors_[norm_method]
+            X_variant = preprocessor.transform(X)
+            X_ensemble = []
+            for shuffle_pattern, _ in configs:
+                X_ensemble.append(X_variant[:, shuffle_pattern])
+            data[norm_method] = np.stack(X_ensemble, axis=0)
+        return data
 
     def _batch_forward(self, Xs, ys, shuffle_patterns=None):
         """Process model forward passes in batches to manage memory efficiently.
@@ -482,6 +571,31 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     X_batch,
                     y_batch,
                     feature_shuffles=pattern_batch,
+                    return_logits=True if self.average_logits else False,
+                    softmax_temperature=self.softmax_temperature,
+                    inference_config=self.inference_config_,
+                )
+            outputs.append(out.float().cpu().numpy())
+
+        return np.concatenate(outputs, axis=0)
+
+    def _batch_forward_with_cache(self, Xs, kv_cache: TabICLCache):
+        batch_size = self.batch_size or Xs.shape[0]
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        X_batches = np.array_split(Xs, n_batches)
+
+        outputs = []
+        offset = 0
+        for X_batch in X_batches:
+            batch_count = X_batch.shape[0]
+            cache_subset = kv_cache.slice_batch(offset, offset + batch_count)
+            offset += batch_count
+
+            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+            with torch.no_grad():
+                out = self.model_.forward_with_cache(
+                    X_test=X_batch,
+                    cache=cache_subset,
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
@@ -540,11 +654,16 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
         X = self.X_encoder_.transform(X)
 
-        data = self.ensemble_generator_.transform(X)
         outputs = []
-        for norm_method, (Xs, ys) in data.items():
-            shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
-            outputs.append(self._batch_forward(Xs, ys, shuffle_patterns))
+        if self.model_kv_cache_ is not None:
+            data = self._prepare_test_cache_data(X)
+            for norm_method, Xs in data.items():
+                outputs.append(self._batch_forward_with_cache(Xs, self.model_kv_cache_[norm_method]))
+        else:
+            data = self.ensemble_generator_.transform(X)
+            for norm_method, (Xs, ys) in data.items():
+                shuffle_patterns = self.ensemble_generator_.feature_shuffle_patterns_[norm_method]
+                outputs.append(self._batch_forward(Xs, ys, shuffle_patterns))
         outputs = np.concatenate(outputs, axis=0)
 
         # Extract class shift offsets from ensemble generator

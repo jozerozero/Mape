@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Optional
 from collections import OrderedDict
 import math
 import torch
@@ -8,7 +9,8 @@ from torch import nn, Tensor
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .inference import InferenceManager
-from .inference_config import MgrConfig
+from .inference_config import InferenceConfig, MgrConfig
+from .kv_cache import KVCache
 
 
 class ICLearning(nn.Module):
@@ -59,6 +61,7 @@ class ICLearning(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        bias_free_ln: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -72,9 +75,10 @@ class ICLearning(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            bias_free_ln=bias_free_ln,
         )
         if self.norm_first:
-            self.ln = nn.LayerNorm(d_model)
+            self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 
         self.y_encoder = OneHotAndLinear(max_classes, d_model)
         self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, max_classes))
@@ -219,7 +223,7 @@ class ICLearning(nn.Module):
 
         train_size = y_train.shape[1]
         R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
-        src = self.tf_icl(R, attn_mask=train_size)
+        src = self.tf_icl(R, train_size=train_size)
         if self.norm_first:
             src = self.ln(src)
         out = self.decoder(src)  # (B, T, max_classes)
@@ -381,15 +385,7 @@ class ICLearning(nn.Module):
         """
         # Configure inference parameters
         if mgr_config is None:
-            mgr_config = MgrConfig(
-                min_batch_size=1,
-                safety_factor=0.8,
-                offload=False,
-                auto_offload_pct=0.5,
-                device=None,
-                use_amp=True,
-                verbose=False,
-            )
+            mgr_config = InferenceConfig().ICL_CONFIG
         self.inference_mgr.configure(**mgr_config)
 
         num_classes = len(torch.unique(y_train[0]))
@@ -468,4 +464,113 @@ class ICLearning(nn.Module):
         else:
             out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
 
+        return out
+
+    def prepare_repr_cache(self, R: Tensor, y_train: Tensor) -> Tensor:
+        train_size = y_train.shape[1]
+        R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
+        return R
+
+    def _icl_predictions_repr_cache(self, R: Tensor, train_size: int) -> Tensor:
+        src = self.tf_icl(R, train_size=train_size)
+        if self.norm_first:
+            src = self.ln(src)
+        return self.decoder(src)
+
+    def forward_with_repr_cache(
+        self,
+        R: Tensor,
+        train_size: int,
+        num_classes: Optional[int] = None,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        mgr_config: MgrConfig = None,
+    ) -> Tensor:
+        if mgr_config is None:
+            mgr_config = InferenceConfig().ICL_CONFIG
+        self.inference_mgr.configure(**mgr_config)
+
+        out = self.inference_mgr(
+            self._icl_predictions_repr_cache,
+            inputs=OrderedDict([("R", R), ("train_size", train_size)]),
+        )
+        out = out[:, train_size:]
+        if num_classes is not None:
+            out = out[..., :num_classes]
+            if not return_logits:
+                out = torch.softmax(out / softmax_temperature, dim=-1)
+        return out
+
+    def _icl_predictions_with_cache(
+        self,
+        R: Tensor,
+        icl_cache: KVCache,
+        y_train: Optional[Tensor] = None,
+        use_cache: bool = False,
+        store_cache: bool = True,
+    ) -> Tensor:
+        train_size = None
+        if store_cache:
+            assert y_train is not None, "y_train must be provided when store_cache=True"
+            train_size = y_train.shape[1]
+            R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
+
+        src = self.tf_icl.forward_with_cache(
+            R,
+            icl_cache=icl_cache,
+            train_size=train_size,
+            use_cache=use_cache,
+            store_cache=store_cache,
+        )
+        if self.norm_first:
+            src = self.ln(src)
+        return self.decoder(src)
+
+    def forward_with_cache(
+        self,
+        R: Tensor,
+        icl_cache: KVCache,
+        y_train: Optional[Tensor] = None,
+        num_classes: Optional[int] = None,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        use_cache: bool = False,
+        store_cache: bool = True,
+        mgr_config: MgrConfig = None,
+    ) -> Tensor:
+        if use_cache == store_cache:
+            raise ValueError("Exactly one of use_cache or store_cache must be True")
+
+        if store_cache:
+            assert y_train is not None, "y_train must be provided when store_cache=True"
+            num_classes = len(torch.unique(y_train[0]))
+            if num_classes > self.max_classes:
+                raise ValueError(
+                    f"KV caching is not supported when num_classes ({num_classes}) exceeds max_classes ({self.max_classes})"
+                )
+        else:
+            assert num_classes is not None, "num_classes must be provided when use_cache=True"
+
+        if mgr_config is None:
+            mgr_config = InferenceConfig().ICL_CONFIG
+        self.inference_mgr.configure(**mgr_config)
+
+        out = self.inference_mgr(
+            self._icl_predictions_with_cache,
+            inputs=OrderedDict(
+                [
+                    ("R", R),
+                    ("icl_cache", icl_cache),
+                    ("y_train", y_train),
+                    ("use_cache", use_cache),
+                    ("store_cache", store_cache),
+                ]
+            ),
+        )
+
+        if store_cache:
+            out = out[:, y_train.shape[1] :]
+        out = out[..., :num_classes]
+        if not return_logits:
+            out = torch.softmax(out / softmax_temperature, dim=-1)
         return out

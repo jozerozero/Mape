@@ -10,7 +10,28 @@ from math import pi
 import torch
 from torch import nn, einsum, broadcast_tensors, Tensor
 
-from einops import rearrange, repeat
+try:
+    from einops import rearrange, repeat
+except ImportError:
+    def rearrange(x, pattern, **kwargs):
+        if pattern == "... (d r) -> ... d r":
+            r = kwargs["r"]
+            return x.reshape(*x.shape[:-1], x.shape[-1] // r, r)
+        if pattern == "... d r -> ... (d r)":
+            return x.reshape(*x.shape[:-2], x.shape[-2] * x.shape[-1])
+        if pattern == "... r f -> ... (r f)":
+            return x.reshape(*x.shape[:-2], x.shape[-2] * x.shape[-1])
+        if pattern == "n d -> n 1 d":
+            return x.unsqueeze(-2)
+        if pattern == "n -> n 1":
+            return x.unsqueeze(-1)
+        raise ImportError(f"einops is required for unsupported rearrange pattern: {pattern}")
+
+    def repeat(x, pattern, **kwargs):
+        if pattern == "... n -> ... (n r)":
+            r = kwargs["r"]
+            return x.repeat_interleave(r, dim=-1)
+        raise ImportError(f"einops is required for unsupported repeat pattern: {pattern}")
 
 from typing import Literal
 

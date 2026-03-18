@@ -14,6 +14,8 @@ from scipy.optimize import fsolve
 import torch
 from torch import Tensor
 
+from .kv_cache import KVCache
+
 
 class MemoryEstimator:
     """Estimates peak activation memory requirements for different attention-based components.
@@ -364,6 +366,8 @@ class InferenceManager:
             for name, value in inputs.items():
                 if isinstance(value, torch.Tensor):
                     inputs_on_exe[name] = self.to_exe_device(value)
+                elif isinstance(value, KVCache):
+                    inputs_on_exe[name] = value.to(self.exe_device) if value.is_populated() else value
                 else:
                     inputs_on_exe[name] = value
 
@@ -453,6 +457,8 @@ class InferenceManager:
             for name, value in inputs.items():
                 if isinstance(value, torch.Tensor):
                     inputs_on_exe[name] = self.to_exe_device(value)
+                elif isinstance(value, KVCache):
+                    inputs_on_exe[name] = value.to(self.exe_device) if value.is_populated() else value
                 else:
                     inputs_on_exe[name] = value
 
@@ -474,6 +480,7 @@ class InferenceManager:
         outputs = torch.empty(output_shape, dtype=input_dtype, device=output_device)
 
         # Main inference loop with OOM recovery
+        store_cache_keys = {name for name, value in inputs.items() if isinstance(value, KVCache) and not value.is_populated()}
         while True:
             try:
                 # Calculate how to split batch dimensions based on estimated batch size
@@ -494,6 +501,14 @@ class InferenceManager:
                                 output = forward_fn(**batch_dict)
                         else:
                             output = forward_fn(**batch_dict)
+
+                        for cache_key in store_cache_keys:
+                            batch_cache = batch_dict[cache_key]
+                            if batch_cache.is_populated():
+                                original_cache = inputs[cache_key]
+                                if not original_cache.is_populated():
+                                    original_cache.preallocate(batch_cache, tuple(batch_dims), device=self.exe_device)
+                                original_cache[indices] = batch_cache
 
                         if self.offload:
                             # Move output to CPU before assigning to save GPU memory
@@ -522,6 +537,8 @@ class InferenceManager:
                 # Clear CUDA memory and reduce batch size
                 if self.exe_device.type == "cuda":
                     torch.cuda.empty_cache()
+                for cache_key in store_cache_keys:
+                    inputs[cache_key].kv.clear()
 
                 batch_size = max(self.min_batch_size, batch_size // 2)
 
@@ -633,6 +650,11 @@ class InferenceManager:
                 if isinstance(value, torch.Tensor):
                     # Move slice to execution device
                     batch_dict[name] = self.to_exe_device(value[slice_tuple])
+                elif isinstance(value, KVCache):
+                    if value.is_populated():
+                        batch_dict[name] = value[slice_tuple].to(self.exe_device)
+                    else:
+                        batch_dict[name] = KVCache()
                 else:
                     # Non-tensor values are passed as is
                     batch_dict[name] = value
