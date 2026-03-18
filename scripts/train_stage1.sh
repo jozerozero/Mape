@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --np_seed 43 \
             --torch_seed 42 \
             --max_steps 160000 \
-            --batch_size 256 \
+            --batch_size 128 \
             --micro_batch_size 4 \
             --lr 2e-4 \
             --optimizer muon \
@@ -69,8 +69,8 @@ python "${PRIOR_GEN_FILE}" \
     --torch_seed 42 \
     --num_batches 160000 \
     --resume_from 0 \
-    --batch_size 256 \
-    --batch_size_per_gp 4 \
+    --batch_size 128 \
+    --batch_size_per_gp 2 \
     --prior_type mix_scm \
     --min_features 2 \
     --max_features 100 \
@@ -94,7 +94,7 @@ torchrun --standalone --nproc_per_node=8 "${RUN_FILE}" \
             --np_seed 43 \
             --torch_seed 42 \
             --max_steps 160000 \
-            --batch_size 256 \
+            --batch_size 128 \
             --micro_batch_size 4 \
             --lr 2e-4 \
             --optimizer muon \
