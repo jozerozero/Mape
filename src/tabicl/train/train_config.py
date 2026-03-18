@@ -205,8 +205,8 @@ def build_parser():
     ###### Checkpointing ######################################################
     ###########################################################################
     parser.add_argument("--checkpoint_dir", default=None, type=str, help="Directory for checkpoint saving and loading")
-    parser.add_argument("--save_temp_every", default=50, type=int, help="Steps between temporary checkpoints")
-    parser.add_argument("--save_perm_every", default=5000, type=int, help="Steps between permanent checkpoints")
+    parser.add_argument("--save_temp_every", default=1000, type=int, help="Steps between temporary checkpoints")
+    parser.add_argument("--save_perm_every", default=10000, type=int, help="Steps between permanent checkpoints")
     parser.add_argument(
         "--max_checkpoints",
         type=int,
