@@ -176,16 +176,23 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_affine": self.config.col_affine,
+            "col_feature_group": self.config.col_feature_group,
+            "col_feature_group_size": self.config.col_feature_group_size,
+            "col_target_aware": self.config.col_target_aware,
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,
             "row_rope_base": self.config.row_rope_base,
+            "row_last_cls_only": self.config.row_last_cls_only,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "bias_free_ln": self.config.bias_free_ln,
+            "arch_mode": self.config.arch_mode,
         }
 
         model = TabICL(**self.model_config)
@@ -378,9 +385,6 @@ class Trainer:
             checkpoint_path = self.config.checkpoint_path
         elif hasattr(self.config, "checkpoint_dir") and self.config.checkpoint_dir:
             checkpoint_path = self.get_latest_checkpoint()
-
-        # checkpoint_path = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/tabicl-classifier-v1.1-0506.ckpt"
-        checkpoint_path = "/vast/users/guangyi.chen/causal_group/zijian.li/LDM/tabicl_new/tabicl/stabe1/checkpoint/dir1/step-100400.ckpt"
         if checkpoint_path is None or not os.path.exists(checkpoint_path):
             print("No checkpoint found, starting from scratch.")
             return

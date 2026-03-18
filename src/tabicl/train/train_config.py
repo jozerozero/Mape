@@ -7,6 +7,17 @@ def str2bool(value):
     return value.lower() == "true"
 
 
+def feature_group_type(value):
+    lowered = value.lower()
+    if lowered in {"false", "none", "0"}:
+        return False
+    if lowered in {"true", "1"}:
+        return True
+    if lowered in {"same", "valid"}:
+        return lowered
+    raise argparse.ArgumentTypeError("Feature group must be one of: false, true, same, valid")
+
+
 def train_size_type(value):
     """Custom type function to handle both int and float train sizes."""
     value = float(value)
@@ -179,6 +190,25 @@ def build_parser():
     parser.add_argument("--col_num_blocks", type=int, default=3, help="Number of blocks in column embedder")
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
+    parser.add_argument("--col_affine", default=True, type=str2bool, help="Whether to use affine column projection")
+    parser.add_argument(
+        "--col_feature_group",
+        default=False,
+        type=feature_group_type,
+        help="Column grouping mode: false, true, same, or valid",
+    )
+    parser.add_argument(
+        "--col_feature_group_size",
+        type=int,
+        default=3,
+        help="Feature group size when grouped column embedding is enabled",
+    )
+    parser.add_argument(
+        "--col_target_aware",
+        default=False,
+        type=str2bool,
+        help="Whether to inject training labels into column embeddings",
+    )
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
 
     # Row Interaction Config
@@ -186,6 +216,12 @@ def build_parser():
     parser.add_argument("--row_nhead", type=int, default=8, help="Number of attention heads in row interactor")
     parser.add_argument("--row_num_cls", type=int, default=4, help="Number of CLS tokens in row interactor")
     parser.add_argument("--row_rope_base", type=float, default=100000, help="RoPE base value for row interactor")
+    parser.add_argument(
+        "--row_last_cls_only",
+        default=False,
+        type=str2bool,
+        help="Whether to compute only CLS queries in the last row-interaction block",
+    )
     parser.add_argument("--freeze_row", default=False, type=str2bool, help="Whether to freeze the row interactor")
 
     # ICL Config
@@ -199,6 +235,18 @@ def build_parser():
     parser.add_argument("--activation", type=str, default="gelu", help="Activation function type")
     parser.add_argument(
         "--norm_first", default=True, type=str2bool, help="If True, use pre-norm transformer architecture"
+    )
+    parser.add_argument(
+        "--bias_free_ln",
+        default=False,
+        type=str2bool,
+        help="If True, use bias-free LayerNorm in all transformer modules",
+    )
+    parser.add_argument(
+        "--arch_mode",
+        type=str,
+        default="v2",
+        help="Architecture mode recorded in checkpoints. Use 'legacy' for old-compatible training.",
     )
 
     ###########################################################################
