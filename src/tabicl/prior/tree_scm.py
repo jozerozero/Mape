@@ -187,9 +187,7 @@ class TreeSCM(nn.Module):
         The computing device ('cpu' or 'cuda') where tensors will be allocated.
 
     **kwargs : dict
-        Optional extra settings:
-        - graph_sparsity: float in [0, 1], default=0.2.
-          Fraction of X columns to decorrelate from y by row permutation.
+        Unused hyperparameters passed from parent configurations.
     """
 
     def __init__(
@@ -239,9 +237,6 @@ class TreeSCM(nn.Module):
         self.noise_std = noise_std
         self.pre_sample_noise_std = pre_sample_noise_std
         self.device = device
-        self.graph_sparsity = float(kwargs.get("graph_sparsity", 0.2))
-        if not (0.0 <= self.graph_sparsity <= 1.0):
-            raise ValueError(f"graph_sparsity must be in [0, 1], got {self.graph_sparsity}")
 
         if self.is_causal:
             # Ensure enough intermediate variables for sampling X and y
@@ -313,7 +308,6 @@ class TreeSCM(nn.Module):
 
         # Handle outputs based on causality
         X, y = self.handle_outputs(causes, outputs)
-        X = self.apply_graph_sparsity(X)
 
         # Check for NaNs and handle them by setting to default values
         if torch.any(torch.isnan(X)) or torch.any(torch.isnan(y)):
@@ -324,20 +318,6 @@ class TreeSCM(nn.Module):
             y = y.squeeze(-1)
 
         return X, y
-
-    def apply_graph_sparsity(self, X: torch.Tensor) -> torch.Tensor:
-        """Decorrelate a fraction of X columns from y by row permutation."""
-        if self.graph_sparsity <= 0.0 or X.shape[1] == 0:
-            return X
-
-        mask = torch.rand((X.shape[1],), device=X.device) < self.graph_sparsity
-        if not bool(mask.any()):
-            return X
-
-        X = X.clone()
-        perm = torch.randperm(X.shape[0], device=X.device)
-        X[:, mask] = X[perm][:, mask]
-        return X
 
     def handle_outputs(self, causes, outputs):
         """

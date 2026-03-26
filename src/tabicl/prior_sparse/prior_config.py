@@ -16,6 +16,8 @@ DEFAULT_FIXED_HP = {
     "scale_by_max_features": False,
     "permute_features": True,
     "permute_labels": True,
+    # MLPSCM and TreeSCM
+    "graph_sparsity": 0.1,
 }
 
 DEFAULT_SAMPLED_HP = {
